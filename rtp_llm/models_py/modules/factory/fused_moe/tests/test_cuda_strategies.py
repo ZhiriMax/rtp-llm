@@ -566,8 +566,8 @@ class TestCudaFp8PerBlockPureCPStrategy(unittest.TestCase):
         self.assertTrue(strategy.can_handle(config))
 
     @patch("rtp_llm.models_py.kernels.cuda.deepgemm_wrapper.has_deep_gemm")
-    def test_can_handle_pure_cp_ep_auto(self, mock_has_deep_gemm: Any) -> None:
-        """moe_strategy=auto + pure CP+EP topology should be selected."""
+    def test_can_handle_false_auto_falls_back_to_deepep(self, mock_has_deep_gemm: Any) -> None:
+        """moe_strategy=auto + pure CP+EP topology should NOT auto-select PureCP (falls back to DeepEP)."""
         mock_has_deep_gemm.return_value = True
 
         config = create_moe_config_adapter(
@@ -579,7 +579,7 @@ class TestCudaFp8PerBlockPureCPStrategy(unittest.TestCase):
         )
 
         strategy = CudaFp8PerBlockPureCPStrategy()
-        self.assertTrue(strategy.can_handle(config))
+        self.assertFalse(strategy.can_handle(config))
 
     @patch("rtp_llm.models_py.kernels.cuda.deepgemm_wrapper.has_deep_gemm")
     def test_can_handle_false_dp_gt_1(self, mock_has_deep_gemm: Any) -> None:
@@ -685,8 +685,8 @@ class TestCudaFp8PerBlockPureDPStrategy(unittest.TestCase):
         self.assertTrue(strategy.can_handle(config))
 
     @patch("rtp_llm.models_py.kernels.cuda.deepgemm_wrapper.has_deep_gemm")
-    def test_can_handle_pure_dp_ep_auto(self, mock_has_deep_gemm: Any) -> None:
-        """moe_strategy=auto + pure DP+EP topology should be selected."""
+    def test_can_handle_false_auto_falls_back_to_deepep(self, mock_has_deep_gemm: Any) -> None:
+        """moe_strategy=auto + pure DP+EP topology should NOT auto-select PureDP (falls back to DeepEP)."""
         mock_has_deep_gemm.return_value = True
 
         config = create_moe_config_adapter(
@@ -698,7 +698,7 @@ class TestCudaFp8PerBlockPureDPStrategy(unittest.TestCase):
         )
 
         strategy = CudaFp8PerBlockPureDPStrategy()
-        self.assertTrue(strategy.can_handle(config))
+        self.assertFalse(strategy.can_handle(config))
 
     @patch("rtp_llm.models_py.kernels.cuda.deepgemm_wrapper.has_deep_gemm")
     def test_can_handle_false_tp_gt_1(self, mock_has_deep_gemm: Any) -> None:

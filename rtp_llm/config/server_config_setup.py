@@ -70,21 +70,25 @@ def auto_configure_deepep(
             "to allow MoriEP router selection"
         )
 
-    # allgather is valid only in "pure" parallel modes:
-    #   - single GPU (ep==1)
-    #   - pure TP                 (tp>1, dp==1, ep==tp, prefill CP disabled)
-    #   - pure CP attention + EP  (tp>1, dp==1, ep==tp, prefill CP enabled)
-    #   - pure DP attention + EP  (tp==1, dp>1, ep==dp)
-    # Mixed tp>1 with dp>1 is intentionally routed back to DeepEP.
-    cp_enabled = parallelism_config.prefill_cp_config.is_enabled()
+    # allgather default applies only to single GPU and pure TP (no CP).
+    # PureCP / PureDP routers exist but must be opted in via --moe_strategy
+    # (auto-selection falls back to DeepEP). CP-enabled topologies share the
+    # tp>1 / dp==1 / ep==tp shape with pure TP, so they must be excluded here
+    # to avoid silently disabling DeepEP without selecting PureCP.
+    prefill_cp_enabled = parallelism_config.prefill_cp_config.is_enabled()
     is_single_gpu = ep_size == 1
-    is_pure_tp = tp_size > 1 and dp_size == 1 and ep_size == tp_size and not cp_enabled
-    is_pure_cp_ep = tp_size > 1 and dp_size == 1 and ep_size == tp_size and cp_enabled
-    is_pure_dp_ep = tp_size == 1 and dp_size > 1 and ep_size == dp_size
+    is_pure_tp = (
+        tp_size > 1
+        and dp_size == 1
+        and ep_size == tp_size
+        and not prefill_cp_enabled
+    )
+
     moe_config.use_all_gather = (
         moe_config.use_all_gather
         and not deep_ep_config.use_deepep_low_latency
-        and (is_single_gpu or is_pure_tp or is_pure_cp_ep or is_pure_dp_ep)
+        and not deep_ep_config.use_deepep_moe
+        and (is_single_gpu or is_pure_tp)
     )
     if moe_config.use_all_gather:
         moe_config.use_deepep_moe = False
