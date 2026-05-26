@@ -13,6 +13,9 @@ public:
 
 public:
     void init(const std::shared_ptr<GenerateInput>& generate_input, size_t extra_reserve_token_num = 0);
+    void initFromRows(const std::vector<std::vector<int32_t>>& token_rows,
+                      int                                      common_len,
+                      size_t                                   extra_reserve_token_num = 0);
 
     std::vector<int> completeTokenIdsVec(int batch_id);
     std::vector<int> commonCompleteTokenIdsVec(int batch_id);

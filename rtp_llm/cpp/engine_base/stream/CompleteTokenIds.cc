@@ -1,5 +1,6 @@
 #include "rtp_llm/cpp/engine_base/stream/CompleteTokenIds.h"
 
+#include <algorithm>
 #include <sstream>
 
 namespace rtp_llm {
@@ -61,6 +62,36 @@ void CompleteTokenIds::init(const std::shared_ptr<GenerateInput>& generate_input
     }
 
     RTP_LLM_LOG_DEBUG("complete tokenids init done, %s", showStatus(0).c_str());
+}
+
+
+void CompleteTokenIds::initFromRows(const std::vector<std::vector<int32_t>>& token_rows,
+                                    int                                      common_len,
+                                    size_t                                   extra_reserve_token_num) {
+    RTP_LLM_CHECK_WITH_INFO(!token_rows.empty(), "token_rows can't be empty");
+    RTP_LLM_CHECK_WITH_INFO(token_rows.size() <= (size_t)max_batch_size_,
+                            "token_rows size[%zu] must be <= max_batch_size[%d]",
+                            token_rows.size(),
+                            max_batch_size_);
+
+    batch_size_ = (int)token_rows.size();
+    seq_length_ = 0;
+    for (const auto& row : token_rows) {
+        seq_length_ = std::max(seq_length_, (int)row.size());
+    }
+    RTP_LLM_CHECK_WITH_INFO(seq_length_ <= max_seq_len_,
+                            "seq_length[%d] must be less than max_seq_len[%d]",
+                            seq_length_,
+                            max_seq_len_);
+    common_len_             = std::min(common_len, seq_length_);
+    start_check_seq_length_ = seq_length_;
+
+    size_t max_token_num = max_seq_len_ + extra_reserve_token_num;
+    complete_token_ids_  = torch::zeros({(int64_t)max_batch_size_, (int64_t)max_token_num}, torch::kInt32);
+    for (size_t i = 0; i < token_rows.size(); ++i) {
+        memcpy(data((int)i), token_rows[i].data(), token_rows[i].size() * sizeof(int32_t));
+    }
+    RTP_LLM_LOG_DEBUG("complete tokenids initFromRows done, %s", showStatus(0).c_str());
 }
 
 int CompleteTokenIds::maxBatchSize() {

@@ -2,6 +2,7 @@
 #include "rtp_llm/cpp/engine_base/stream/GenerateConfig.h"
 #include "rtp_llm/cpp/engine_base/stream/GenerateTypes.h"
 #include "rtp_llm/cpp/multimodal_processor/MultimodalTypes.h"
+#include "rtp_llm/cpp/cache/Types.h"
 
 #include <cstdint>
 #include <optional>
@@ -35,6 +36,11 @@ public:
     std::optional<std::vector<MultimodalInput>> multimodal_inputs;
     std::optional<MultimodalFeature>            multimodal_features;
     std::optional<torch::Tensor>                input_embeddings;
+    torch::Tensor                               prefix_lengths;
+    BatchKVCacheResourcePtr                     kv_cache_resource;
+    CompleteTokenIdsPtr                         complete_token_ids;
+    bool                                        enable_prefix_kv_cache = false;
+    int64_t                                     common_prefix_length   = 0;
 
     void        checkVaild();
     std::string debugString() const {
@@ -43,7 +49,9 @@ public:
                      << "token_ids: [" << token_ids.sizes() << "]"
                      << ", token_type_ids: [" << token_type_ids.sizes() << "]"
                      << ", input_lengths: [" << input_lengths.sizes() << "]"
-                     << ", total_length: " << total_length << "}";
+                     << ", total_length: " << total_length
+                     << ", enable_prefix_kv_cache: " << enable_prefix_kv_cache
+                     << ", common_prefix_length: " << common_prefix_length << "}";
         if (input_embeddings.has_value()) {
             debug_string << ", input_embeddings: [" << input_embeddings.value().sizes() << "]";
         }

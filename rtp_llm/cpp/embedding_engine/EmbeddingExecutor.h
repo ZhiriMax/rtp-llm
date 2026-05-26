@@ -12,6 +12,7 @@
 #include "rtp_llm/cpp/models/SampleInfos.h"
 #include "rtp_llm/cpp/embedding_engine/ModelRequest.h"
 #include "rtp_llm/cpp/engine_base/Executor.h"
+#include "rtp_llm/cpp/cache/KVCacheManager.h"
 
 namespace rtp_llm {
 
@@ -35,7 +36,11 @@ using Flag = std::bitset<NUM_INPUT_TYPES>;
 
 class EmbeddingExecutor {
 public:
-    explicit EmbeddingExecutor(const EngineInitParams& params, py::object handler);
+    explicit EmbeddingExecutor(const EngineInitParams&          params,
+                               py::object                      handler,
+                               std::shared_ptr<KVCacheManager> cache_manager          = nullptr,
+                               int32_t                         kv_cache_group_num     = 0,
+                               std::vector<int32_t>            kv_cache_layer_to_group = {});
 
     absl::Status process(const std::list<EmbeddingStreamPtr>& streams);
 
@@ -48,7 +53,11 @@ private:
     kmonitor::MetricsReporterPtr metrics_reporter_ = nullptr;
     ModelConfig                  model_config_;
     ParallelismConfig            parallelism_config;
-    EPLBConfig                   eplb_config;
+    EPLBConfig                      eplb_config;
+    std::shared_ptr<KVCacheManager> cache_manager_;
+    CacheConfig                     cache_config_;
+    int32_t                         kv_cache_group_num_ = 0;
+    std::vector<int32_t>            kv_cache_layer_to_group_;
 
     ModelRequest                     generateOldModelRequest(GptModelInputs& model_input);
     absl::StatusOr<GptModelInputs>   gatherModelInput(const std::list<EmbeddingStreamPtr>& streams) const;
@@ -64,6 +73,10 @@ private:
     void calcTokenNum(const std::list<EmbeddingStreamPtr>& streams, int64_t& token_num, int64_t& batch_size) const;
     void init_position_ids(int max_seq_len);
     void reportMetrics(size_t context_batch_size, size_t combo_token_num, size_t max_seq_len) const;
+    absl::Status processNormal(const std::list<EmbeddingStreamPtr>& streams);
+    absl::Status processPrefixCacheStream(const EmbeddingStreamPtr& stream);
+    bool shouldUsePrefixKVCache(const EmbeddingStreamPtr& stream) const;
+    void fillKVCacheMetadata(GptModelInputs& model_input, size_t max_blocks_num) const;
 };
 
 }  // namespace rtp_llm

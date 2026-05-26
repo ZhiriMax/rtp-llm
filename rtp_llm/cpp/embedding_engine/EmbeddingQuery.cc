@@ -73,6 +73,12 @@ void EmbeddingInput::checkVaild() {
     if (input_embeddings.has_value() && total_length != input_embeddings.value().size(0)) {
         throw std::runtime_error("sum of token length don't equal to total_length");
     }
+    if (prefix_lengths.defined() && prefix_lengths.dim() != 1) {
+        throw std::runtime_error("prefix_lengths shape size != 1");
+    }
+    if (prefix_lengths.defined() && prefix_lengths.size(0) != input_lengths.size(0)) {
+        throw std::runtime_error("prefix_lengths size should equal to input_lengths size");
+    }
 }
 
 }  // namespace rtp_llm

@@ -15,6 +15,8 @@
 #include "rtp_llm/cpp/embedding_engine/EmbeddingStream.h"
 #include "rtp_llm/cpp/embedding_engine/EmbeddingScheduler.h"
 #include "rtp_llm/cpp/engine_base/stream/StreamCacheResource.h"
+#include "rtp_llm/cpp/cache/KVCacheManager.h"
+#include "rtp_llm/cpp/config/ConfigModules.h"
 
 namespace rtp_llm {
 
@@ -54,6 +56,7 @@ public:
 private:
     absl::Status trySaveStepError() const;
     void         loop();
+    void         initCacheManagerIfNeeded(const EngineInitParams& params, py::object handler);
 
 private:
     ModelConfig                         model_config_;
@@ -66,6 +69,10 @@ private:
     ResourceContext                     resource_context_;
     kmonitor::MetricsReporterPtr        metrics_reporter_ = nullptr;
     StepWindowProfiler                  step_profiler_;
+    RuntimeConfig                       runtime_config_;
+    KVCacheConfig                       kv_cache_config_;
+    int32_t                             kv_cache_group_num_ = 0;
+    std::vector<int32_t>                kv_cache_layer_to_group_;
 };
 
 }  // namespace rtp_llm
