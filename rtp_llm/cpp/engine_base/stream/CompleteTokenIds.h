@@ -13,6 +13,13 @@ public:
 
 public:
     void init(const std::shared_ptr<GenerateInput>& generate_input, size_t extra_reserve_token_num = 0);
+    // Lightweight init for the embedding engine's prefix-kv-cache split path:
+    // allocates the [max_batch_size, max_seq_len] backing tensor, copies token
+    // rows into it, and sets seq_length_/common_len_ so that the rolling-hash
+    // cache_keys generation and commonSeqLength()-based intra-batch sharing
+    // work the same way as the GenerateInput-driven init().
+    // Each row in `rows` must be ≤ max_seq_len_ (constructor arg).
+    void initFromRows(const std::vector<std::vector<int32_t>>& rows, int common_len);
 
     std::vector<int> completeTokenIdsVec(int batch_id);
     std::vector<int> commonCompleteTokenIdsVec(int batch_id);

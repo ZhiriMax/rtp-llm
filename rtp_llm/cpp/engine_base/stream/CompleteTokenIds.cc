@@ -40,6 +40,28 @@ CompleteTokenIds::CompleteTokenIds(const CompleteTokenIds& other, bool share, in
     }
 }
 
+void CompleteTokenIds::initFromRows(const std::vector<std::vector<int32_t>>& rows, int common_len) {
+    RTP_LLM_CHECK_WITH_INFO(rows.size() == (size_t)batch_size_,
+                            "rows.size(%lu) != batch_size_(%d)", rows.size(), batch_size_);
+    int max_row_len = 0;
+    for (const auto& row : rows) {
+        max_row_len = std::max(max_row_len, (int)row.size());
+    }
+    RTP_LLM_CHECK_WITH_INFO(max_row_len <= max_seq_len_,
+                            "max_row_len(%d) > max_seq_len_(%d)", max_row_len, max_seq_len_);
+    seq_length_             = max_row_len;
+    common_len_             = common_len;
+    start_check_seq_length_ = seq_length_;
+    complete_token_ids_ =
+        torch::zeros({(int64_t)max_batch_size_, (int64_t)max_seq_len_}, torch::kInt32);
+    auto* dst_base = complete_token_ids_.data_ptr<int32_t>();
+    for (int i = 0; i < batch_size_; ++i) {
+        std::memcpy(dst_base + (size_t)i * max_seq_len_,
+                    rows[i].data(),
+                    rows[i].size() * sizeof(int32_t));
+    }
+}
+
 void CompleteTokenIds::init(const std::shared_ptr<GenerateInput>& generate_input, size_t extra_reserve_token_num) {
     RTP_LLM_CHECK(generate_input != nullptr);
 

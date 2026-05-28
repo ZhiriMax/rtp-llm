@@ -567,11 +567,13 @@ absl::Status EmbeddingExecutor::processPrefixCacheStream(const EmbeddingStreamPt
 
     // CompleteTokenIds wraps a [batch, max_seq_len] int32 tensor; the
     // cache_manager reads token bytes from data(batch_idx) to compute the
-    // rolling cache_keys. Build a 1-row CompleteTokenIds covering reuse_len.
+    // rolling cache_keys. Use initFromRows() to allocate the backing buffer
+    // and copy our prefix tokens — the default constructor only stores
+    // metadata and leaves complete_token_ids_ undefined, which would fail
+    // the size(1) check inside setSeqLength().
     auto prefix_complete_token_ids =
         std::make_shared<CompleteTokenIds>(/*batch_size=*/1, /*max_batch_size=*/1, reuse_len, block_size);
-    prefix_complete_token_ids->setSeqLength(reuse_len);
-    memcpy(prefix_complete_token_ids->data(0), prefix_tokens.data(), reuse_len * sizeof(int32_t));
+    prefix_complete_token_ids->initFromRows({prefix_tokens}, reuse_len);
     initCacheKeys(prefix_kv_resource, prefix_complete_token_ids, block_size);
 
     MallocInfo prefix_malloc_info;
@@ -633,12 +635,9 @@ absl::Status EmbeddingExecutor::processPrefixCacheStream(const EmbeddingStreamPt
     }
     auto suffix_complete_token_ids =
         std::make_shared<CompleteTokenIds>(batch_size, batch_size, max_row_len, block_size);
-    suffix_complete_token_ids->setSeqLength(max_row_len);
-    for (int i = 0; i < batch_size; ++i) {
-        memcpy(suffix_complete_token_ids->data(i),
-               full_token_rows[i].data(),
-               full_token_rows[i].size() * sizeof(int32_t));
-    }
+    // common_len = reuse_len so initMallocForCommonLen treats the first
+    // reuse_len tokens as the shared-prefix portion to dedup across batches.
+    suffix_complete_token_ids->initFromRows(full_token_rows, reuse_len);
     initCacheKeys(suffix_kv_resource, suffix_complete_token_ids, block_size);
 
     MallocInfo suffix_malloc_info;
