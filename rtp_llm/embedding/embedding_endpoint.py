@@ -106,6 +106,8 @@ class EmbeddingEndpoint(object):
             input_lengths=input.input_lengths.tolist(),  # 输入长度
             request_id=1,  # 唯一请求ID
             multimodal_features=multimodal_features,
+            enable_prefix_kv_cache=getattr(input, "enable_prefix_kv_cache", False),
+            common_prefix_length=getattr(input, "common_prefix_length", 0),
         )
         try:
             response = await stub.embedding(request)

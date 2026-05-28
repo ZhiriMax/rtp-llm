@@ -54,6 +54,11 @@ public:
 private:
     absl::Status trySaveStepError() const;
     void         loop();
+    // Allocates a paged-attention KVCacheManager when the python custom-handler
+    // declares `enable_prefix_kv_cache=True` (Mainse shared user-prefix path).
+    // No-op otherwise — keeps normal embedding paths compute-equivalent to
+    // pre-prefix-kv-cache behaviour.
+    void initCacheManagerIfNeeded(const EngineInitParams& params, py::object handler);
 
 private:
     ModelConfig                         model_config_;
@@ -66,6 +71,11 @@ private:
     ResourceContext                     resource_context_;
     kmonitor::MetricsReporterPtr        metrics_reporter_ = nullptr;
     StepWindowProfiler                  step_profiler_;
+    // Forwarded from EngineInitParams; used by initCacheManagerIfNeeded.
+    RuntimeConfig                       runtime_config_;
+    KVCacheConfig                       kv_cache_config_;
+    int32_t                             kv_cache_group_num_{1};
+    std::vector<int32_t>                kv_cache_layer_to_group_;
 };
 
 }  // namespace rtp_llm

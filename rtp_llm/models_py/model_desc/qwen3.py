@@ -125,12 +125,25 @@ class Qwen3Model(GptModelBase):
         hidden_states = inputs_embeds
         if fmha_impl is None:
             fmha_impl = self.prepare_fmha_impl(inputs)
+        # Embedding-engine paths may build the model with a paged kv_cache pool
+        # (e.g. when prefix-kv-cache is enabled at startup) but issue per-request
+        # forward calls that do NOT carry block ids (normal decode of a single
+        # query). In that case the model must fall back to the non-paged varlen
+        # path; otherwise rope+cache write goes through a null block table and
+        # GPU asserts. Gate paged dispatch on actual block-id presence.
+        attn_inputs = inputs.attention_inputs
+        block_id_host = getattr(attn_inputs, "kv_cache_kernel_block_id_host", None)
+        has_blocks = (
+            self.kv_cache is not None
+            and block_id_host is not None
+            and block_id_host.numel() > 0
+        )
         for i, decoder_layer in enumerate(self.layers[: self.layer_num]):
             select_block_map_for_layer(inputs.attention_inputs, i)
             hidden_states = decoder_layer(
                 hidden_states,
                 fmha_impl,
-                kv_cache=self.kv_cache.get_layer_cache(i) if self.kv_cache else None,
+                kv_cache=self.kv_cache.get_layer_cache(i) if has_blocks else None,
             )
         hidden_states = self.norm(hidden_states)
         return PyModelOutputs(hidden_states, fmha_impl.fmha_params)

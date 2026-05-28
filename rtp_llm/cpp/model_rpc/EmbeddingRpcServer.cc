@@ -38,6 +38,10 @@ grpc::Status EmbeddingRpcServiceImpl::embedding(grpc::ServerContext*    context,
         std::optional<MultimodalFeature> multimodal_features = std::nullopt;
         embedding_input =
             std::make_shared<EmbeddingInput>(token_ids, token_type_ids, input_lengths, request_id, multimodal_features);
+        // Forward Mainse-style prefix-kv-cache flags from the gRPC request.
+        // The engine-side shouldUsePrefixKVCache then performs the final feasibility check.
+        embedding_input->enable_prefix_kv_cache = request->enable_prefix_kv_cache();
+        embedding_input->common_prefix_length   = request->common_prefix_length();
 
         if (mm_processor_ != nullptr && !multimodal_inputs.empty()) {
             auto mm_res = mm_processor_->updateMultimodalFeatures(embedding_input, multimodal_inputs);

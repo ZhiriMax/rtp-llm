@@ -1,4 +1,6 @@
 #include "rtp_llm/cpp/embedding_engine/EmbeddingEngine.h"
+#include "rtp_llm/cpp/cache/CacheConfigCreator.h"
+#include "rtp_llm/cpp/cache/KVCacheManager.h"
 #include "rtp_llm/models_py/bindings/core/ExecOps.h"
 #include "rtp_llm/models_py/bindings/NoBlockCopy.h"
 #include "rtp_llm/cpp/utils/StatusUtil.h"
@@ -16,7 +18,9 @@ EmbeddingEngine::EmbeddingEngine(const EngineInitParams& params, py::object hand
     metrics_reporter_(params.metrics_reporter),
     step_profiler_(params.profiling_debug_logging_config.torch_cuda_profiler_dir,
                    params.parallelism_config.dp_rank * params.parallelism_config.tp_size
-                       + params.parallelism_config.tp_rank) {
+                       + params.parallelism_config.tp_rank),
+    runtime_config_(params.runtime_config),
+    kv_cache_config_(params.kv_cache_config) {
     {
         size_t device_id = params.parallelism_config.world_rank % params.parallelism_config.local_world_size;
         rtp_llm::initRuntime(device_id,
@@ -24,12 +28,45 @@ EmbeddingEngine::EmbeddingEngine(const EngineInitParams& params, py::object hand
                              params.device_resource_config.enable_comm_overlap,
                              params.model_config_.mla_ops_type);
     }
+    initCacheManagerIfNeeded(params, handler);
     warmupNoBlockCopy();
-    executor_.reset(new EmbeddingExecutor(params, handler));
+    executor_.reset(new EmbeddingExecutor(
+        params, handler, resource_context_.cache_manager, kv_cache_group_num_, kv_cache_layer_to_group_));
     scheduler_.reset(
         new EmbeddingScheduler(model_config_, concurrency_config, params.runtime_config, metrics_reporter_));
 
     (void)startLoop();
+}
+
+void EmbeddingEngine::initCacheManagerIfNeeded(const EngineInitParams& params, py::object handler) {
+    bool enable_prefix_kv_cache = false;
+    {
+        py::gil_scoped_acquire acquire;
+        if (py::hasattr(handler, "enable_prefix_kv_cache")) {
+            enable_prefix_kv_cache = py::cast<bool>(handler.attr("enable_prefix_kv_cache"));
+        }
+    }
+    if (!enable_prefix_kv_cache) {
+        return;
+    }
+
+    auto cache_config = CacheConfigCreator::createConfig(
+        model_config_, parallelism_config, runtime_config_, kv_cache_config_, std::nullopt);
+    RTP_LLM_LOG_INFO("create embedding prefix kv cache manager with config %s", cache_config.debugString().c_str());
+    resource_context_.cache_manager = std::make_shared<KVCacheManager>(
+        cache_config, false, metrics_reporter_, kv_cache_config_, parallelism_config, runtime_config_);
+    resource_context_.role_type = params.pd_sep_config.role_type;
+    if (!resource_context_.cache_manager->init()) {
+        RTP_LLM_FAIL("init embedding prefix kv cache manager failed");
+    }
+
+    const auto& cache_cfg = resource_context_.cache_manager->cacheConfig();
+    kv_cache_group_num_   = static_cast<int32_t>(cache_cfg.groupNums());
+    kv_cache_layer_to_group_.clear();
+    kv_cache_layer_to_group_.reserve(cache_cfg.layer_to_group_id.size());
+    for (const auto group_id : cache_cfg.layer_to_group_id) {
+        kv_cache_layer_to_group_.push_back(static_cast<int32_t>(group_id));
+    }
 }
 
 EmbeddingEngine::~EmbeddingEngine() {

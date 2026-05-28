@@ -1,4 +1,6 @@
 #pragma once
+#include "rtp_llm/cpp/cache/BatchKVCacheResource.h"
+#include "rtp_llm/cpp/engine_base/stream/CompleteTokenIds.h"
 #include "rtp_llm/cpp/engine_base/stream/GenerateConfig.h"
 #include "rtp_llm/cpp/engine_base/stream/GenerateTypes.h"
 #include "rtp_llm/cpp/multimodal_processor/MultimodalTypes.h"
@@ -35,6 +37,21 @@ public:
     std::optional<std::vector<MultimodalInput>> multimodal_inputs;
     std::optional<MultimodalFeature>            multimodal_features;
     std::optional<torch::Tensor>                input_embeddings;
+    // Mainse-style shared user-prefix cache flags. The renderer sets these per
+    // request; the engine-side `shouldUsePrefixKVCache` performs the final
+    // feasibility check (batch_size>1, prefix>=block_size, etc.) before
+    // actually splitting the forward into a (prefix, suffix) pair.
+    bool                                        enable_prefix_kv_cache{false};
+    int64_t                                     common_prefix_length{0};
+
+    // Per-batch prefix kv-cache prefill lengths and kv resource handle. These
+    // are set internally by `processPrefixCacheStream` when it constructs the
+    // synthetic prefix/suffix sub-streams, and consumed by `gatherModelInput`
+    // to populate `GptModelInputs.kv_cache_kernel_block_id` and to offset
+    // RoPE position ids by the cached prefix length.
+    torch::Tensor                               prefix_lengths;
+    BatchKVCacheResourcePtr                     kv_cache_resource;
+    CompleteTokenIdsPtr                         complete_token_ids;
 
     void        checkVaild();
     std::string debugString() const {

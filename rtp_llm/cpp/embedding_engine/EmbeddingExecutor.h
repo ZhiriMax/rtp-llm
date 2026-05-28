@@ -12,6 +12,7 @@
 #include "rtp_llm/cpp/models/SampleInfos.h"
 #include "rtp_llm/cpp/embedding_engine/ModelRequest.h"
 #include "rtp_llm/cpp/engine_base/Executor.h"
+#include "rtp_llm/cpp/cache/KVCacheManager.h"
 
 namespace rtp_llm {
 
@@ -35,20 +36,28 @@ using Flag = std::bitset<NUM_INPUT_TYPES>;
 
 class EmbeddingExecutor {
 public:
-    explicit EmbeddingExecutor(const EngineInitParams& params, py::object handler);
+    EmbeddingExecutor(const EngineInitParams&          params,
+                      py::object                       handler,
+                      std::shared_ptr<KVCacheManager>  cache_manager           = nullptr,
+                      int32_t                          kv_cache_group_num      = 1,
+                      std::vector<int32_t>             kv_cache_layer_to_group = {});
 
     absl::Status process(const std::list<EmbeddingStreamPtr>& streams);
 
 private:
-    std::unique_ptr<ModelBase>   model_;
-    py::object                   handler_;
-    HandlerArgs::Flag            handler_args_;
-    py::handle                   torch_type_;
-    torch::Tensor                max_position_ids_tensor_;
-    kmonitor::MetricsReporterPtr metrics_reporter_ = nullptr;
-    ModelConfig                  model_config_;
-    ParallelismConfig            parallelism_config;
-    EPLBConfig                   eplb_config;
+    std::unique_ptr<ModelBase>      model_;
+    py::object                      handler_;
+    HandlerArgs::Flag               handler_args_;
+    py::handle                      torch_type_;
+    torch::Tensor                   max_position_ids_tensor_;
+    kmonitor::MetricsReporterPtr    metrics_reporter_ = nullptr;
+    ModelConfig                     model_config_;
+    ParallelismConfig               parallelism_config;
+    EPLBConfig                      eplb_config;
+    std::shared_ptr<KVCacheManager> cache_manager_;
+    CacheConfig                     cache_config_;
+    int32_t                         kv_cache_group_num_{1};
+    std::vector<int32_t>            kv_cache_layer_to_group_;
 
     ModelRequest                     generateOldModelRequest(GptModelInputs& model_input);
     absl::StatusOr<GptModelInputs>   gatherModelInput(const std::list<EmbeddingStreamPtr>& streams) const;
@@ -64,6 +73,15 @@ private:
     void calcTokenNum(const std::list<EmbeddingStreamPtr>& streams, int64_t& token_num, int64_t& batch_size) const;
     void init_position_ids(int max_seq_len);
     void reportMetrics(size_t context_batch_size, size_t combo_token_num, size_t max_seq_len) const;
+    // Helper: fill the static parts of `model_input.kv_cache_*` (group→layer
+    // mapping, group types, block strides). Only invoked when at least one
+    // stream carries a `kv_cache_resource`. No-op when cache_manager is null.
+    void fillKVCacheMetadata(GptModelInputs& model_input, size_t max_blocks_num) const;
+    // Per-stream variant of `process`. Today this is the only path; once
+    // prefix-kv-cache split is enabled it routes the prefix/suffix sub-streams.
+    absl::Status processNormal(const std::list<EmbeddingStreamPtr>& streams);
+    bool         shouldUsePrefixKVCache(const EmbeddingStreamPtr& stream) const;
+    absl::Status processPrefixCacheStream(const EmbeddingStreamPtr& stream);
 };
 
 }  // namespace rtp_llm

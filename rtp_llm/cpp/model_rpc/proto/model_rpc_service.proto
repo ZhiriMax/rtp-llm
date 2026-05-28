@@ -421,6 +421,8 @@ message EmbeddingInputPB {
     repeated int32 input_lengths = 3;
     int64 request_id = 4;
     repeated MultimodalInputPB multimodal_features = 5;
+    bool enable_prefix_kv_cache = 6;
+    int64 common_prefix_length = 7;
 }
 
 message EmbeddingHealthRequestPB {
