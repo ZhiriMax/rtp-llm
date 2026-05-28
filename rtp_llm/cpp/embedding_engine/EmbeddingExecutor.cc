@@ -613,7 +613,10 @@ absl::Status EmbeddingExecutor::processPrefixCacheStream(const EmbeddingStreamPt
     }
     auto prefix_model_input = std::move(prefix_status.value());
     model_->releaseBuffers();
+    RTP_LLM_LOG_INFO("[mainse-prefix] req=%ld start prefix forward batch=1 reuse_len=%d",
+                     input->request_id, reuse_len);
     (void)model_->forward(prefix_model_input);
+    RTP_LLM_LOG_INFO("[mainse-prefix] req=%ld prefix forward done", input->request_id);
 
     // ---------- Step 2: register the just-written prefix blocks in BlockCache ----------
     InsertInfo insert_info{prefix_kv_resource, prefix_complete_token_ids, /*is_resident=*/false};
@@ -694,7 +697,14 @@ absl::Status EmbeddingExecutor::processPrefixCacheStream(const EmbeddingStreamPt
     auto model_request      = generateOldModelRequest(suffix_model_input);
     auto total_batch_size   = model_request.context_batch_size;
     model_->releaseBuffers();
+    int max_suffix = 0;
+    for (auto v : suffix_input_lengths) max_suffix = std::max(max_suffix, v);
+    RTP_LLM_LOG_INFO("[mainse-prefix] req=%ld start suffix forward batch=%d max_suffix_len=%d "
+                     "reuse_len=%d suffix_malloc_reuse_len=%d",
+                     input->request_id, batch_size, max_suffix, reuse_len,
+                     suffix_malloc_result.reuse_len);
     auto model_output = std::move(model_->forward(suffix_model_input));
+    RTP_LLM_LOG_INFO("[mainse-prefix] req=%ld suffix forward done", input->request_id);
 
     py::gil_scoped_acquire acquire;
     auto                   post_status = postProcess(model_request, model_output);
