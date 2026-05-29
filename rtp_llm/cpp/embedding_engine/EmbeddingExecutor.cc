@@ -185,7 +185,7 @@ absl::StatusOr<GptModelInputs> EmbeddingExecutor::gatherModelInput(const std::li
     auto           i32_options = torch::TensorOptions(torch::kInt32).pinned_memory(true);
 
     // Determine whether ANY stream carries a kv_cache_resource (only the
-    // synthetic prefix/suffix sub-streams built by processPrefixCacheStream do
+    // synthetic prefix/suffix sub-streams built by processPrefixCacheBatch do
     // — normal HTTP streams have nullptr kv_cache_resource and skip the paged
     // dispatch in Qwen3Model.forward via the has_blocks guard).
     size_t max_blocks_num = 0;
@@ -518,231 +518,242 @@ bool EmbeddingExecutor::shouldUsePrefixKVCache(const EmbeddingStreamPtr& stream)
 //
 // Any failure in malloc/insertIntoCache falls back to processNormal so the
 // request still completes correctly.
-absl::Status EmbeddingExecutor::processPrefixCacheStream(const EmbeddingStreamPtr& stream) {
-    auto input      = stream->embeddingInput();
-    int  batch_size = (int)stream->batchSize();
-    int  block_size = (int)cache_config_.seq_size_per_block;
+//
+// Batched implementation: this single function handles ALL eligible streams
+// in a step at once.  The previous per-stream version did K independent
+// (prefix forward batch=1) + (suffix forward batch=N) pairs which destroyed
+// GPU batching utilisation.  Here we:
+//   * call cache_manager_->malloc once per stream (independent),
+//   * collect cache MISSes into ONE varlen prefix forward (batch=K_miss),
+//   * insertIntoCache for each MISS,
+//   * collect ALL eligible streams (HIT and MISS) into ONE varlen suffix
+//     forward (batch = sum_k(N_k), each slot's prefix_lengths set to its
+//     stream's reuse_len so attention reads its own user prefix from cache).
+absl::Status EmbeddingExecutor::processPrefixCacheBatch(const std::list<EmbeddingStreamPtr>& streams) {
+    if (streams.empty()) {
+        return absl::OkStatus();
+    }
+    int block_size = (int)cache_config_.seq_size_per_block;
     if (block_size <= 0) {
-        return processNormal({stream});
-    }
-    int common_prefix_len = (int)input->common_prefix_length;
-    int reuse_len         = common_prefix_len / block_size * block_size;
-    if (reuse_len <= 0) {
-        return processNormal({stream});
+        return processNormal(streams);
     }
 
-    auto* token_ptr      = input->token_ids.data_ptr<int32_t>();
-    auto* token_type_ptr = input->token_type_ids.data_ptr<int32_t>();
-    auto* length_ptr     = input->input_lengths.data_ptr<int32_t>();
+    struct StreamCtx {
+        EmbeddingStreamPtr                       orig;
+        std::vector<std::vector<int32_t>>        full_token_rows;
+        std::vector<std::vector<int32_t>>        full_type_rows;
+        int                                      reuse_len{0};
+        int                                      batch_size{0};
+        std::shared_ptr<BatchKVCacheResource>    kv_resource;
+        std::shared_ptr<CompleteTokenIds>        complete_token_ids;
+        bool                                     prefix_in_cache{false};
+    };
 
-    std::vector<std::vector<int32_t>> full_token_rows;
-    std::vector<std::vector<int32_t>> full_type_rows;
-    full_token_rows.reserve(batch_size);
-    full_type_rows.reserve(batch_size);
-    int64_t offset = 0;
-    for (int i = 0; i < batch_size; ++i) {
-        int row_len = length_ptr[i];
-        if (row_len < reuse_len) {
-            return processNormal({stream});
+    std::vector<StreamCtx> ctxs;
+    ctxs.reserve(streams.size());
+
+    auto cleanup_all = [&]() {
+        for (auto& c : ctxs) {
+            if (!c.kv_resource) continue;
+            FreeInfo info;
+            info.batch_kv_cache_resource = c.kv_resource;
+            info.complete_token_ids      = c.complete_token_ids;
+            info.request_id              = c.orig->embeddingInput()->request_id;
+            cache_manager_->free(info);
         }
-        full_token_rows.emplace_back(token_ptr + offset, token_ptr + offset + row_len);
-        full_type_rows.emplace_back(token_type_ptr + offset, token_type_ptr + offset + row_len);
-        offset += row_len;
-    }
+    };
 
     const auto kernel_blocks_per_kv_block = cache_config_.kernelBlocksPerKvBlock();
     const auto group_types                = cache_config_.group_types;
 
-    // ---------- Step 1: prefix forward (batch=1 over user tokens) ----------
-    auto prefix_kv_resource = std::make_shared<BatchKVCacheResource>();
-    prefix_kv_resource->resetBatchSize(1);
-    prefix_kv_resource->initGroups(kv_cache_group_num_,
-                                   cache_config_.layer_all_num,
-                                   cache_config_.layer_to_group_id,
-                                   kernel_blocks_per_kv_block,
-                                   group_types);
+    // ─── Step 1: per-stream malloc + cache hit/miss detection ──────────────
+    for (auto& stream : streams) {
+        StreamCtx ctx;
+        ctx.orig                = stream;
+        auto input              = stream->embeddingInput();
+        ctx.batch_size          = (int)stream->batchSize();
+        int common_prefix_len   = (int)input->common_prefix_length;
+        ctx.reuse_len           = common_prefix_len / block_size * block_size;
+        if (ctx.reuse_len <= 0) {
+            cleanup_all();
+            return processNormal(streams);
+        }
 
-    std::vector<int32_t> prefix_tokens(full_token_rows[0].begin(), full_token_rows[0].begin() + reuse_len);
-    std::vector<int32_t> prefix_types(full_type_rows[0].begin(), full_type_rows[0].begin() + reuse_len);
+        auto* token_ptr = input->token_ids.data_ptr<int32_t>();
+        auto* type_ptr  = input->token_type_ids.data_ptr<int32_t>();
+        auto* len_ptr   = input->input_lengths.data_ptr<int32_t>();
+        int64_t offset = 0;
+        for (int i = 0; i < ctx.batch_size; ++i) {
+            int row_len = len_ptr[i];
+            if (row_len < ctx.reuse_len) {
+                cleanup_all();
+                return processNormal(streams);
+            }
+            ctx.full_token_rows.emplace_back(token_ptr + offset, token_ptr + offset + row_len);
+            ctx.full_type_rows.emplace_back(type_ptr + offset, type_ptr + offset + row_len);
+            offset += row_len;
+        }
 
-    // CompleteTokenIds wraps a [batch, max_seq_len] int32 tensor; the
-    // cache_manager reads token bytes from data(batch_idx) to compute the
-    // rolling cache_keys. Use initFromRows() to allocate the backing buffer
-    // and copy our prefix tokens — the default constructor only stores
-    // metadata and leaves complete_token_ids_ undefined, which would fail
-    // the size(1) check inside setSeqLength().
-    auto prefix_complete_token_ids =
-        std::make_shared<CompleteTokenIds>(/*batch_size=*/1, /*max_batch_size=*/1, reuse_len, block_size);
-    prefix_complete_token_ids->initFromRows({prefix_tokens}, reuse_len);
-    initCacheKeys(prefix_kv_resource, prefix_complete_token_ids, block_size);
+        ctx.kv_resource = std::make_shared<BatchKVCacheResource>();
+        ctx.kv_resource->resetBatchSize(ctx.batch_size);
+        ctx.kv_resource->initGroups(kv_cache_group_num_,
+                                    cache_config_.layer_all_num,
+                                    cache_config_.layer_to_group_id,
+                                    kernel_blocks_per_kv_block,
+                                    group_types);
 
-    MallocInfo prefix_malloc_info;
-    prefix_malloc_info.batch_kv_cache_resource = prefix_kv_resource;
-    prefix_malloc_info.complete_token_ids      = prefix_complete_token_ids;
-    prefix_malloc_info.request_id              = input->request_id;
-    prefix_malloc_info.reuse_cache             = true;
-    prefix_malloc_info.enable_device_cache     = true;
-    auto prefix_malloc_result                  = cache_manager_->malloc(prefix_malloc_info);
-    if (!prefix_malloc_result.success) {
-        RTP_LLM_LOG_WARNING("[mainse-prefix] prefix malloc failed, fallback to normal embedding path");
-        return processNormal({stream});
+        int max_row_len = 0;
+        for (auto& row : ctx.full_token_rows) {
+            max_row_len = std::max(max_row_len, (int)row.size());
+        }
+        ctx.complete_token_ids = std::make_shared<CompleteTokenIds>(
+            ctx.batch_size, ctx.batch_size, max_row_len, block_size);
+        ctx.complete_token_ids->initFromRows(ctx.full_token_rows, ctx.reuse_len);
+        initCacheKeys(ctx.kv_resource, ctx.complete_token_ids, block_size);
+
+        MallocInfo mi;
+        mi.batch_kv_cache_resource = ctx.kv_resource;
+        mi.complete_token_ids      = ctx.complete_token_ids;
+        mi.request_id              = input->request_id;
+        mi.reuse_cache             = true;
+        mi.enable_device_cache     = true;
+        auto result                = cache_manager_->malloc(mi);
+        if (!result.success) {
+            RTP_LLM_LOG_WARNING("[mainse-prefix-batch] malloc failed for req=%ld",
+                                input->request_id);
+            ctx.kv_resource.reset();  // don't try to free what didn't allocate
+            cleanup_all();
+            return processNormal(streams);
+        }
+
+        ctx.prefix_in_cache = (result.reuse_len >= ctx.reuse_len);
+        RTP_LLM_LOG_INFO(
+            "[mainse-prefix-batch] req=%ld batch=%d reuse_len=%d malloc_reuse=%d %s",
+            input->request_id, ctx.batch_size, ctx.reuse_len, result.reuse_len,
+            ctx.prefix_in_cache ? "HIT" : "MISS");
+
+        ctxs.push_back(std::move(ctx));
     }
 
-    auto free_prefix = [&]() {
-        FreeInfo info;
-        info.batch_kv_cache_resource = prefix_kv_resource;
-        info.complete_token_ids      = prefix_complete_token_ids;
-        info.request_id              = input->request_id;
-        cache_manager_->free(info);
-    };
-
-    // Build a 1-row sub-stream and run the prefix forward through processNormal's
-    // helpers (gatherModelInput / forward / postProcess). We call model_->forward
-    // directly since we don't need to run postProcess on the prefix.
-    std::vector<int32_t> prefix_lengths_vec{reuse_len};
-    auto prefix_input_obj =
-        std::make_shared<EmbeddingInput>(prefix_tokens, prefix_types, prefix_lengths_vec, input->request_id);
-    prefix_input_obj->prefix_lengths    = torch::zeros({1}, torch::kInt32);
-    prefix_input_obj->kv_cache_resource = prefix_kv_resource;
-    std::list<EmbeddingStreamPtr> prefix_streams{std::make_shared<EmbeddingStream>(prefix_input_obj)};
-
-    auto prefix_status = gatherModelInput(prefix_streams);
-    if (!prefix_status.ok()) {
-        free_prefix();
-        return prefix_status.status();
-    }
-    auto prefix_model_input = std::move(prefix_status.value());
-    model_->releaseBuffers();
-    RTP_LLM_LOG_INFO("[mainse-prefix] req=%ld start prefix forward batch=1 reuse_len=%d",
-                     input->request_id, reuse_len);
-    (void)model_->forward(prefix_model_input);
-    RTP_LLM_LOG_INFO("[mainse-prefix] req=%ld prefix forward done", input->request_id);
-
-    // ---------- Step 2: register the just-written prefix blocks in BlockCache ----------
-    InsertInfo insert_info{prefix_kv_resource, prefix_complete_token_ids, /*is_resident=*/false};
-    cache_manager_->insertIntoCache(insert_info);
-    free_prefix();
-
-    // ---------- Step 3: malloc full sequences (batch=N) with reuse_cache=true ----------
-    auto suffix_kv_resource = std::make_shared<BatchKVCacheResource>();
-    suffix_kv_resource->resetBatchSize(batch_size);
-    suffix_kv_resource->initGroups(kv_cache_group_num_,
-                                   cache_config_.layer_all_num,
-                                   cache_config_.layer_to_group_id,
-                                   kernel_blocks_per_kv_block,
-                                   group_types);
-
-    int max_row_len = 0;
-    for (auto& row : full_token_rows) {
-        max_row_len = std::max(max_row_len, (int)row.size());
-    }
-    auto suffix_complete_token_ids =
-        std::make_shared<CompleteTokenIds>(batch_size, batch_size, max_row_len, block_size);
-    // common_len = reuse_len so initMallocForCommonLen treats the first
-    // reuse_len tokens as the shared-prefix portion to dedup across batches.
-    suffix_complete_token_ids->initFromRows(full_token_rows, reuse_len);
-    initCacheKeys(suffix_kv_resource, suffix_complete_token_ids, block_size);
-
-    MallocInfo suffix_malloc_info;
-    suffix_malloc_info.batch_kv_cache_resource = suffix_kv_resource;
-    suffix_malloc_info.complete_token_ids      = suffix_complete_token_ids;
-    suffix_malloc_info.request_id              = input->request_id;
-    suffix_malloc_info.reuse_cache             = true;
-    suffix_malloc_info.enable_device_cache     = true;
-    auto suffix_malloc_result                  = cache_manager_->malloc(suffix_malloc_info);
-    if (!suffix_malloc_result.success) {
-        RTP_LLM_LOG_WARNING("[mainse-prefix] suffix malloc failed, fallback to normal embedding path");
-        return processNormal({stream});
+    // ─── Step 2: ONE batched prefix forward for all cache MISSes ──────────
+    std::list<EmbeddingStreamPtr> miss_prefix_streams;
+    for (auto& ctx : ctxs) {
+        if (ctx.prefix_in_cache) continue;
+        std::vector<int32_t> prefix_tokens(ctx.full_token_rows[0].begin(),
+                                           ctx.full_token_rows[0].begin() + ctx.reuse_len);
+        std::vector<int32_t> prefix_types(ctx.full_type_rows[0].begin(),
+                                          ctx.full_type_rows[0].begin() + ctx.reuse_len);
+        std::vector<int32_t> prefix_lengths_vec{ctx.reuse_len};
+        auto prefix_input_obj = std::make_shared<EmbeddingInput>(
+            prefix_tokens, prefix_types, prefix_lengths_vec,
+            ctx.orig->embeddingInput()->request_id);
+        prefix_input_obj->prefix_lengths    = torch::zeros({1}, torch::kInt32);
+        // Reuse the full kv_resource: writes go to slot-0 blocks which slots
+        // 1..N-1 reference (via initMallocForCommonLen), so the user K/V is
+        // visible to every slot of the suffix forward without extra copies.
+        prefix_input_obj->kv_cache_resource = ctx.kv_resource;
+        miss_prefix_streams.push_back(std::make_shared<EmbeddingStream>(prefix_input_obj));
     }
 
-    auto free_suffix = [&]() {
-        FreeInfo info;
-        info.batch_kv_cache_resource = suffix_kv_resource;
-        info.complete_token_ids      = suffix_complete_token_ids;
-        info.request_id              = input->request_id;
-        cache_manager_->free(info);
-    };
+    if (!miss_prefix_streams.empty()) {
+        auto prefix_status = gatherModelInput(miss_prefix_streams);
+        if (!prefix_status.ok()) {
+            cleanup_all();
+            return prefix_status.status();
+        }
+        auto prefix_model_input = std::move(prefix_status.value());
+        model_->releaseBuffers();
+        RTP_LLM_LOG_INFO("[mainse-prefix-batch] prefix forward batch=%lu (varlen)",
+                         miss_prefix_streams.size());
+        (void)model_->forward(prefix_model_input);
 
-    // ---------- Step 4: suffix forward (only suffix tokens, prefix via cache) ----------
-    std::vector<int32_t> suffix_tokens;
-    std::vector<int32_t> suffix_types;
-    std::vector<int32_t> suffix_input_lengths;
-    std::vector<int32_t> suffix_prefix_lengths;
-    suffix_input_lengths.reserve(batch_size);
-    suffix_prefix_lengths.reserve(batch_size);
-    for (int i = 0; i < batch_size; ++i) {
-        int suffix_len = (int)full_token_rows[i].size() - reuse_len;
-        suffix_tokens.insert(
-            suffix_tokens.end(), full_token_rows[i].begin() + reuse_len, full_token_rows[i].end());
-        suffix_types.insert(
-            suffix_types.end(), full_type_rows[i].begin() + reuse_len, full_type_rows[i].end());
-        suffix_input_lengths.push_back(suffix_len);
-        suffix_prefix_lengths.push_back(reuse_len);
+        // Register each miss stream's prefix into BlockCache so subsequent
+        // requests with the same user hit immediately.
+        for (auto& ctx : ctxs) {
+            if (ctx.prefix_in_cache) continue;
+            InsertInfo info{ctx.kv_resource, ctx.complete_token_ids, /*is_resident=*/false};
+            cache_manager_->insertIntoCache(info);
+        }
     }
-    auto suffix_input_obj =
-        std::make_shared<EmbeddingInput>(suffix_tokens, suffix_types, suffix_input_lengths, input->request_id);
-    suffix_input_obj->prefix_lengths    = torch::from_blob(suffix_prefix_lengths.data(),
-                                                        {(int64_t)suffix_prefix_lengths.size()},
-                                                        torch::kInt32)
-                                           .clone();
-    suffix_input_obj->kv_cache_resource = suffix_kv_resource;
-    std::list<EmbeddingStreamPtr> suffix_streams{std::make_shared<EmbeddingStream>(suffix_input_obj)};
+
+    // ─── Step 3: ONE big suffix forward for ALL eligible streams ──────────
+    std::list<EmbeddingStreamPtr> suffix_streams;
+    for (auto& ctx : ctxs) {
+        std::vector<int32_t> suffix_tokens;
+        std::vector<int32_t> suffix_types;
+        std::vector<int32_t> suffix_input_lengths;
+        std::vector<int32_t> suffix_prefix_lengths;
+        suffix_input_lengths.reserve(ctx.batch_size);
+        suffix_prefix_lengths.reserve(ctx.batch_size);
+        for (int i = 0; i < ctx.batch_size; ++i) {
+            int suffix_len = (int)ctx.full_token_rows[i].size() - ctx.reuse_len;
+            suffix_tokens.insert(suffix_tokens.end(),
+                                 ctx.full_token_rows[i].begin() + ctx.reuse_len,
+                                 ctx.full_token_rows[i].end());
+            suffix_types.insert(suffix_types.end(),
+                                ctx.full_type_rows[i].begin() + ctx.reuse_len,
+                                ctx.full_type_rows[i].end());
+            suffix_input_lengths.push_back(suffix_len);
+            suffix_prefix_lengths.push_back(ctx.reuse_len);
+        }
+        auto suffix_input_obj = std::make_shared<EmbeddingInput>(
+            suffix_tokens, suffix_types, suffix_input_lengths,
+            ctx.orig->embeddingInput()->request_id);
+        suffix_input_obj->prefix_lengths = torch::from_blob(suffix_prefix_lengths.data(),
+                                                            {(int64_t)suffix_prefix_lengths.size()},
+                                                            torch::kInt32)
+                                              .clone();
+        suffix_input_obj->kv_cache_resource = ctx.kv_resource;
+        suffix_streams.push_back(std::make_shared<EmbeddingStream>(suffix_input_obj));
+    }
 
     auto suffix_status = gatherModelInput(suffix_streams);
     if (!suffix_status.ok()) {
-        free_suffix();
+        cleanup_all();
         return suffix_status.status();
     }
     auto suffix_model_input = std::move(suffix_status.value());
     auto model_request      = generateOldModelRequest(suffix_model_input);
     auto total_batch_size   = model_request.context_batch_size;
     model_->releaseBuffers();
-    int max_suffix = 0;
-    for (auto v : suffix_input_lengths) max_suffix = std::max(max_suffix, v);
-    RTP_LLM_LOG_INFO("[mainse-prefix] req=%ld start suffix forward batch=%d max_suffix_len=%d "
-                     "reuse_len=%d suffix_malloc_reuse_len=%d",
-                     input->request_id, batch_size, max_suffix, reuse_len,
-                     suffix_malloc_result.reuse_len);
+    RTP_LLM_LOG_INFO("[mainse-prefix-batch] suffix forward streams=%lu total_batch=%lu",
+                     suffix_streams.size(), (size_t)total_batch_size);
     auto model_output = std::move(model_->forward(suffix_model_input));
-    RTP_LLM_LOG_INFO("[mainse-prefix] req=%ld suffix forward done", input->request_id);
 
     py::gil_scoped_acquire acquire;
-    auto                   post_status = postProcess(model_request, model_output);
+    auto post_status = postProcess(model_request, model_output);
     if (!post_status.ok()) {
-        free_suffix();
+        cleanup_all();
         model_->releaseBuffers();
         return post_status.status();
     }
-    // updateStreams expects the original user-facing stream (not the synthetic
-    // suffix sub-stream) so the per-item output tensors land on the right
-    // EmbeddingOutput. The post-process op shapes `[batch_size, output_num]`
-    // already matches the synthetic batch which is the same N items.
-    auto res = updateStreams(post_status.value(), {stream}, total_batch_size);
-    free_suffix();
+
+    std::list<EmbeddingStreamPtr> orig_streams;
+    for (auto& ctx : ctxs) {
+        orig_streams.push_back(ctx.orig);
+    }
+    auto res = updateStreams(post_status.value(), orig_streams, total_batch_size);
+
+    cleanup_all();
     model_->releaseBuffers();
     return res;
 }
 
 absl::Status EmbeddingExecutor::process(const std::list<EmbeddingStreamPtr>& streams) {
-    // Group streams: ones eligible for prefix-kv-cache split run one-at-a-time
-    // through processPrefixCacheStream; the rest are batched through
-    // processNormal preserving previous batching behaviour.
+    // Partition once; then run two batched paths instead of K serial pairs.
+    std::list<EmbeddingStreamPtr> eligible_streams;
     std::list<EmbeddingStreamPtr> normal_streams;
     for (auto& stream : streams) {
         if (shouldUsePrefixKVCache(stream)) {
-            if (!normal_streams.empty()) {
-                auto status = processNormal(normal_streams);
-                if (!status.ok()) {
-                    return status;
-                }
-                normal_streams.clear();
-            }
-            auto status = processPrefixCacheStream(stream);
-            if (!status.ok()) {
-                return status;
-            }
+            eligible_streams.push_back(stream);
         } else {
             normal_streams.push_back(stream);
+        }
+    }
+    if (!eligible_streams.empty()) {
+        auto status = processPrefixCacheBatch(eligible_streams);
+        if (!status.ok()) {
+            return status;
         }
     }
     if (!normal_streams.empty()) {

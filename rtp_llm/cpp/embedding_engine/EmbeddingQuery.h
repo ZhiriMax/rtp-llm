@@ -45,7 +45,7 @@ public:
     int64_t                                     common_prefix_length{0};
 
     // Per-batch prefix kv-cache prefill lengths and kv resource handle. These
-    // are set internally by `processPrefixCacheStream` when it constructs the
+    // are set internally by `processPrefixCacheBatch` when it constructs the
     // synthetic prefix/suffix sub-streams, and consumed by `gatherModelInput`
     // to populate `GptModelInputs.kv_cache_kernel_block_id` and to offset
     // RoPE position ids by the cached prefix length.

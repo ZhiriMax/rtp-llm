@@ -81,7 +81,14 @@ private:
     // prefix-kv-cache split is enabled it routes the prefix/suffix sub-streams.
     absl::Status processNormal(const std::list<EmbeddingStreamPtr>& streams);
     bool         shouldUsePrefixKVCache(const EmbeddingStreamPtr& stream) const;
-    absl::Status processPrefixCacheStream(const EmbeddingStreamPtr& stream);
+    // Batched prefix-kv-cache split path. Receives ALL eligible streams in
+    // this scheduling step at once and runs at most:
+    //   * one batched prefix forward (varlen, batch=K_miss across distinct
+    //     missing user prefixes), and
+    //   * one batched suffix forward (varlen, batch = sum_k(N_k) across all
+    //     eligible streams, with per-slot prefix_lengths set so each slot
+    //     reads its own user prefix from cache).
+    absl::Status processPrefixCacheBatch(const std::list<EmbeddingStreamPtr>& streams);
 };
 
 }  // namespace rtp_llm
