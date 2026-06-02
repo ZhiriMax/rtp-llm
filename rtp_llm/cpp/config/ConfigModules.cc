@@ -383,7 +383,9 @@ std::string RuntimeConfig::to_string() const {
             oss << ", ";
     }
     oss << "]\n"
-        << "specify_gpu_arch: " << specify_gpu_arch;
+        << "specify_gpu_arch: " << specify_gpu_arch << "\n"
+        << "embedding_kv_cache_mode: " << embedding_kv_cache_mode << "\n"
+        << "embedding_kv_cache_commit_policy: " << embedding_kv_cache_commit_policy;
     return oss.str();
 }
 

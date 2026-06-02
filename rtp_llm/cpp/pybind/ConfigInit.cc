@@ -1081,6 +1081,8 @@ PYBIND11_MODULE(libth_transformer_config, m) {
         .def_readwrite("worker_addrs", &RuntimeConfig::worker_addrs)
         // Fields merged from PyDeviceResourceConfig
         .def_readwrite("specify_gpu_arch", &RuntimeConfig::specify_gpu_arch)
+        .def_readwrite("embedding_kv_cache_mode", &RuntimeConfig::embedding_kv_cache_mode)
+        .def_readwrite("embedding_kv_cache_commit_policy", &RuntimeConfig::embedding_kv_cache_commit_policy)
         // Add sub-configs as properties that return references
         .def_property_readonly(
             "batch_decode_scheduler_config",
@@ -1104,10 +1106,12 @@ PYBIND11_MODULE(libth_transformer_config, m) {
                                       self.model_name,
                                       self.worker_grpc_addrs,
                                       self.worker_addrs,
-                                      self.specify_gpu_arch);
+                                      self.specify_gpu_arch,
+                                      self.embedding_kv_cache_mode,
+                                      self.embedding_kv_cache_commit_policy);
             },
             [](py::tuple t) {
-                if (t.size() != 12)
+                if (t.size() != 12 && t.size() != 13 && t.size() != 14)
                     throw std::runtime_error("Invalid state!");
                 RuntimeConfig c;
                 try {
@@ -1123,6 +1127,12 @@ PYBIND11_MODULE(libth_transformer_config, m) {
                     c.worker_grpc_addrs             = t[9].cast<std::vector<std::string>>();
                     c.worker_addrs                  = t[10].cast<std::vector<std::string>>();
                     c.specify_gpu_arch              = t[11].cast<std::string>();
+                    if (t.size() > 12) {
+                        c.embedding_kv_cache_mode = t[12].cast<std::string>();
+                    }
+                    if (t.size() > 13) {
+                        c.embedding_kv_cache_commit_policy = t[13].cast<std::string>();
+                    }
                 } catch (const std::exception& e) {
                     throw std::runtime_error(std::string("RuntimeConfig unpickle error: ") + e.what());
                 }

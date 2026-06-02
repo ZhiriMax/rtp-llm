@@ -23,3 +23,27 @@ def init_engine_group_args(parser, runtime_config):
         default=False,
         help="在服务启动时是否开启损失去预热",
     )
+    engine_group.add_argument(
+        "--embedding_kv_cache_mode",
+        env_name="EMBEDDING_KV_CACHE_MODE",
+        bind_to=(runtime_config, "embedding_kv_cache_mode"),
+        type=str,
+        choices=["off", "block", "in_batch"],
+        default="off",
+        help=(
+            "Embedding Engine KV cache 模式: off=当前路径, block=仅接入 paged KV block, "
+            "in_batch=启用批内公共前缀去重"
+        ),
+    )
+    engine_group.add_argument(
+        "--embedding_kv_cache_commit_policy",
+        env_name="EMBEDDING_KV_CACHE_COMMIT_POLICY",
+        bind_to=(runtime_config, "embedding_kv_cache_commit_policy"),
+        type=str,
+        choices=["prefix_block", "full_block"],
+        default="prefix_block",
+        help=(
+            "Embedding Engine KV cache 提交策略: "
+            "prefix_block=只提交共享前缀完整 block, full_block=提交每行完整 block"
+        ),
+    )
