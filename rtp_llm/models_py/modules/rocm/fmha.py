@@ -14,13 +14,34 @@ class FMHAParams:
     def __init__(self, batch_size: int, max_seq_len: int , seq_lens: Optional[torch.Tensor] = None,
                  kv_cache_block_id_host: Optional[torch.Tensor] = None,
                  kv_cache_block_id_device: Optional[torch.Tensor] = None,
-                 input_lengths: Optional[torch.Tensor] = None):
+                 input_lengths: Optional[torch.Tensor] = None,
+                 prefix_lengths: Optional[torch.Tensor] = None):
         self.batch_size = batch_size
         self.max_seq_len = max_seq_len
         self.seq_lens = seq_lens
         self.kv_cache_block_id_host = kv_cache_block_id_host
         self.kv_cache_block_id_device = kv_cache_block_id_device
         self.input_lengths = input_lengths
+        self.prefix_lengths = prefix_lengths
+        self.cu_seqlens_q = None
+        self.cu_seqlens_k = None
+        self.max_seqlen_q = max_seq_len
+        self.max_seqlen_k = max_seq_len
+        self.token_q_num = 0
+        if input_lengths is not None:
+            input_lengths_gpu = input_lengths.to(torch.device("cuda"), dtype=torch.int32, non_blocking=True)
+            self.cu_seqlens_q = torch.zeros(batch_size + 1, dtype=torch.int32, device=input_lengths_gpu.device)
+            self.cu_seqlens_q[1:] = torch.cumsum(input_lengths_gpu, 0)
+            self.token_q_num = int(input_lengths.sum().item())
+            if prefix_lengths is not None and prefix_lengths.numel() > 0:
+                prefix_lengths_gpu = prefix_lengths.to(input_lengths_gpu.device, dtype=torch.int32, non_blocking=True)
+                kv_lengths = input_lengths_gpu + prefix_lengths_gpu
+                self.max_seqlen_k = int(kv_lengths.max().item())
+            else:
+                kv_lengths = input_lengths_gpu
+                self.max_seqlen_k = max_seq_len
+            self.cu_seqlens_k = torch.zeros(batch_size + 1, dtype=torch.int32, device=input_lengths_gpu.device)
+            self.cu_seqlens_k[1:] = torch.cumsum(kv_lengths, 0)
 
 class FMHAPrefillImplBase(FMHAImplBase):
 
@@ -78,12 +99,16 @@ class AiterPrefillAttnOp():
         # Extract batch size and max sequence length from attention inputs
         batch_size = attn_inputs.input_lengths.size(0)
         max_seq_len = attn_inputs.input_lengths.max().item()
+        prefix_lengths = getattr(attn_inputs, "prefix_lengths", None)
         
         # Create and return fmha_params with the required attributes
         self.fmha_params = FMHAParams(
             batch_size=batch_size,
             max_seq_len=max_seq_len,
-            input_lengths=attn_inputs.input_lengths
+            input_lengths=attn_inputs.input_lengths,
+            prefix_lengths=prefix_lengths,
+            kv_cache_block_id_host=attn_inputs.kv_cache_block_id_host,
+            kv_cache_block_id_device=attn_inputs.kv_cache_block_id_device
         )
         return self.fmha_params
 
@@ -95,6 +120,84 @@ class AiterPrefillAttnOp():
         q_tensor, k_tensor, v_tensor = qkv[0],qkv[1],qkv[2]
         
         batch_size_actual, head_num_actual, seq_len, head_dim = q_tensor.shape
+        has_prefix = (
+            kv_cache is not None
+            and fmha_params.prefix_lengths is not None
+            and fmha_params.prefix_lengths.numel() > 0
+            and fmha_params.prefix_lengths.max().item() > 0
+            and fmha_params.kv_cache_block_id_device is not None
+            and fmha_params.kv_cache_block_id_device.numel() > 0
+        )
+        if has_prefix:
+            valid_queries = []
+            input_lengths = fmha_params.input_lengths
+            for batch_idx in range(batch_size_actual):
+                actual_len = input_lengths[batch_idx].item()
+                valid_queries.append(q_tensor[batch_idx, :, :actual_len, :].transpose(0, 1))
+            q = torch.cat(valid_queries, dim=0)
+
+            key_cache = kv_cache.k_cache_base
+            value_cache = kv_cache.v_cache_base
+            block_size = key_cache.shape[2]
+            vec_size = 16 // key_cache.element_size()
+            key_cache = key_cache.view(
+                key_cache.shape[0],
+                self.head_num_kv,
+                self.head_dim // vec_size,
+                block_size,
+                vec_size,
+            )
+            value_cache = value_cache.view(
+                value_cache.shape[0],
+                self.head_num_kv,
+                block_size // vec_size,
+                self.head_dim,
+                vec_size,
+            )
+            block_table = fmha_params.kv_cache_block_id_device.to(dtype=torch.int32, device=q.device)
+            needed_cols = (fmha_params.max_seqlen_k + block_size - 1) // block_size + 1
+            if block_table.shape[1] < needed_cols:
+                pad = torch.zeros(
+                    (block_table.shape[0], needed_cols - block_table.shape[1]),
+                    dtype=block_table.dtype,
+                    device=block_table.device,
+                )
+                block_table = torch.cat([block_table, pad], dim=1)
+            seqlen_k = (fmha_params.cu_seqlens_k[1:] - fmha_params.cu_seqlens_k[:-1]).to(torch.int32)
+            kv_indptr = torch.zeros(batch_size_actual + 1, dtype=torch.int32, device=q.device)
+            kv_page_indices = torch.zeros(1, dtype=torch.int32, device=q.device)
+            q_descale = None
+            k_descale = None
+            v_descale = None
+            fp8_dtypes = tuple(
+                dtype
+                for dtype in (
+                    getattr(torch, "float8_e4m3fnuz", None),
+                    getattr(torch, "float8_e4m3fn", None),
+                )
+                if dtype is not None
+            )
+            if fp8_dtypes and key_cache.dtype in fp8_dtypes:
+                q_descale = torch.ones(1, dtype=torch.float32, device=q.device)
+                k_descale = torch.ones(1, dtype=torch.float32, device=q.device)
+                v_descale = torch.ones(1, dtype=torch.float32, device=q.device)
+            res = aiter.mha_batch_prefill_func(
+                q,
+                key_cache,
+                value_cache,
+                fmha_params.cu_seqlens_q,
+                kv_indptr,
+                kv_page_indices,
+                fmha_params.max_seqlen_q,
+                fmha_params.max_seqlen_k,
+                causal=True,
+                block_table=block_table,
+                seqlen_k=seqlen_k,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+            )
+            return res.reshape(fmha_params.token_q_num, self.head_num * self.head_dim)
         
         # dimensions for aiter.flash_attn_func  {batch_size, seq_len, head_num, head_dim}
         q = q_tensor.transpose(1, 2)  # {batch_size, seq_len, head_num, head_dim}

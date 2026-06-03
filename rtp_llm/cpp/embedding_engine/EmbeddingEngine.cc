@@ -1,15 +1,64 @@
 #include "rtp_llm/cpp/embedding_engine/EmbeddingEngine.h"
+#include "rtp_llm/cpp/cache/CacheConfigCreator.h"
+#include "rtp_llm/cpp/cache/CacheManager.h"
 #include "rtp_llm/cpp/utils/StatusUtil.h"
 #include "rtp_llm/cpp/utils/Logger.h"
 #include <exception>
+#include <cstdlib>
+#include <string>
 
 using namespace std;
 namespace rtp_llm {
 
+namespace {
+
+std::string embeddingKVCacheModeFromEnv() {
+    const char* mode = std::getenv("EMBEDDING_KV_CACHE_MODE");
+    return mode ? std::string(mode) : std::string(kEmbeddingKVCacheModeOff);
+}
+
+bool enableEmbeddingKVCache(const std::string& mode) {
+    return mode == kEmbeddingKVCacheModeBlock || mode == kEmbeddingKVCacheModeInBatch;
+}
+
+bool supportEmbeddingKVCache(const GptInitParameter& params, std::string& reason) {
+    if (params.use_mla_) {
+        reason = "MLA cache layout is not supported yet";
+        return false;
+    }
+    if (!params.is_causal_) {
+        reason = "non-causal attention cannot safely reuse prefix KV";
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
+
 EmbeddingEngine::EmbeddingEngine(const EngineInitParams& params, py::object handler):
     params_(params.gpt_init_parameter), metrics_reporter_(params.metrics_reporter) {
     rtp_llm::DeviceFactory::initDevices(params.gpt_init_parameter);
-    executor_.reset(new EmbeddingExecutor(params, rtp_llm::DeviceFactory::getDefaultDevice(), handler));
+    auto* device = rtp_llm::DeviceFactory::getDefaultDevice();
+    const auto cache_mode = embeddingKVCacheModeFromEnv();
+    if (enableEmbeddingKVCache(cache_mode)) {
+        std::string unsupported_reason;
+        if (!supportEmbeddingKVCache(params_, unsupported_reason)) {
+            RTP_LLM_LOG_WARNING("embedding kv cache mode %s fallback to off: %s",
+                                cache_mode.c_str(),
+                                unsupported_reason.c_str());
+        } else {
+            if (!params_.use_kvcache_) {
+                RTP_LLM_LOG_INFO("force enable use_kvcache for embedding kv cache mode %s", cache_mode.c_str());
+                params_.use_kvcache_ = true;
+            }
+            auto cache_config = CacheConfigCreator::createConfig(params_);
+            RTP_LLM_LOG_INFO("create embedding cache manager with config %s", cache_config.debugString().c_str());
+            resource_context_.cache_manager =
+                std::make_shared<CacheManager>(cache_config, device, false, metrics_reporter_, params_);
+            resource_context_.reuse_cache = true;
+        }
+    }
+    executor_.reset(new EmbeddingExecutor(params, device, handler, resource_context_.cache_manager, &params_));
     scheduler_.reset(new EmbeddingScheduler(params_, metrics_reporter_));
 
     (void)startLoop();

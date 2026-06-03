@@ -20,10 +20,22 @@ CKAttnPtr FusedRopeKVCachePrefillOp::prepare(torch_ext::PyAttentionInputs attn_i
     }
     // not support has_alibi_slopes
 
-    torch::Tensor cu_seqlens = torch::zeros({batch_size + 1}, torch::TensorOptions(torch::kInt32).device(torch::kCPU));
-    cu_seqlens.slice(0, 1, batch_size + 1) = attn_inputs.input_lengths.cumsum(0);
-    cu_seqlens                             = cu_seqlens.cuda();
-    torch::Tensor cu_kv_seqlens            = cu_seqlens;
+    auto          i32_cpu     = torch::TensorOptions(torch::kInt32).device(torch::kCPU);
+    torch::Tensor cu_seqlens  = torch::zeros({batch_size + 1}, i32_cpu);
+    torch::Tensor input_lens  = attn_inputs.input_lengths.to(torch::kInt32).cpu();
+    cu_seqlens.slice(0, 1, batch_size + 1) = input_lens.cumsum(0);
+
+    torch::Tensor prefix_lengths;
+    bool          has_prefix = attn_inputs.prefix_lengths.defined() && attn_inputs.prefix_lengths.numel() > 0;
+    if (has_prefix) {
+        prefix_lengths = attn_inputs.prefix_lengths.to(torch::kInt32).cpu();
+    } else {
+        prefix_lengths = torch::zeros({batch_size}, i32_cpu);
+    }
+    torch::Tensor cu_kv_seqlens = torch::zeros({batch_size + 1}, i32_cpu);
+    cu_kv_seqlens.slice(0, 1, batch_size + 1) = (input_lens + prefix_lengths).cumsum(0);
+    cu_seqlens                                = cu_seqlens.cuda();
+    cu_kv_seqlens                             = cu_kv_seqlens.cuda();
     CKAttnPtr     attn_params;
     auto          params = device_->PrepareCKAttn(
         attn_configs_, attn_inputs.kv_block_offset, kv_cache_block_id_device, attn_inputs.input_lengths.size(0));
@@ -31,6 +43,12 @@ CKAttnPtr FusedRopeKVCachePrefillOp::prepare(torch_ext::PyAttentionInputs attn_i
     attn_params->attn_type     = torchDTypeToDataType(attn_inputs.dtype);
     attn_params->cu_seqlens    = cu_seqlens;
     attn_params->cu_kv_seqlens = cu_kv_seqlens;
+    attn_params->input_lengths = input_lens;
+    if (has_prefix) {
+        attn_params->prefix_lengths = prefix_lengths.cuda().contiguous();
+    } else {
+        attn_params->prefix_lengths = attn_inputs.prefix_lengths;
+    }
     attn_params->max_seq_len   = attn_inputs.input_lengths.max().item<int32_t>();
     return attn_params;
 }
@@ -45,7 +63,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> FusedRopeKVCachePrefillO
     const int batch_size        = params->cu_seqlens.size(0) - 1;  // 修复：应该减1，与CUDA版本一致
     const int seq_len           = params->max_seq_len;
 
-    const int seq_len_with_prefix = seq_len;  // 如果有 prefix 支持，这里应该是 seq_len + max_prefix_length
+    int max_prefix_length = 0;
+    if (params->prefix_lengths.defined() && params->prefix_lengths.numel() > 0) {
+        max_prefix_length = params->prefix_lengths.max().item<int32_t>();
+    }
+    const int seq_len_with_prefix = seq_len + max_prefix_length;
 
     torch::Tensor q_output = torch::empty({batch_size, local_head_num, seq_len, size_per_head},
                                           torch::TensorOptions(qkv.dtype()).device(qkv.device()));
@@ -62,11 +84,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> FusedRopeKVCachePrefillO
             kv_block_array.scale = kv_cache.value().k_scale_base.data_ptr();
         }
         prefix_prompt_param.kv_block_array = kv_block_array;
-        // if (params.prefix_lengths.size(0)) {
-        //      prefix_prompt_param.d_prefix_prompt_lengths  = params.prefix_lengths.data_ptr<int>();
-        //      prefix_prompt_param.max_prefix_prompt_length = params.prefix_lengths.max().item<int>();
-        //      prefix_prompt_param.count_length             = 1;
-        // }
+        if (max_prefix_length > 0) {
+            prefix_prompt_param.d_prefix_prompt_lengths  = params->prefix_lengths.data_ptr<int>();
+            prefix_prompt_param.max_prefix_prompt_length = max_prefix_length;
+            prefix_prompt_param.count_length             = 1;
+        }
     }
 
     bool store_qkv   = false;  // 不存储回原始 QKV
