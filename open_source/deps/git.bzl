@@ -156,6 +156,13 @@ def git_deps():
     )
 
     new_git_repository(
+        name = "deep_ep",
+        remote = "git@gitlab.alibaba-inc.com:foundation_models/DeepEP.git",
+        commit = "b86c6640bd94d865d13b117a40b4d3969f7b3b33",
+        build_file = str(Label("//3rdparty/deep_ep:deep_ep.BUILD")),
+    )
+
+    new_git_repository(
         name = "flash_attention",
         remote = "https://github.com/Dao-AILab/flash-attention.git",
         # v2.5.6
