@@ -192,6 +192,7 @@ cc_library(
         ":dispatch",
         ":flashinfer_hdrs",
         ":aot_default_additional_params",
+        "@local_config_cuda//cuda:cuda_headers",
     ],
     copts = cuda_copts() + common_copts,
     visibility = ["//visibility:public"],

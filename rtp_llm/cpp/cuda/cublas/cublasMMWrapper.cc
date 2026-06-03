@@ -17,7 +17,7 @@
 #include "cublasMMWrapper.h"
 #include "rtp_llm/cpp/utils/ScopeGuard.h"
 #include <algorithm>
-#include "nvToolsExt.h"
+#include <nvtx3/nvToolsExt.h>
 
 #ifndef CUDART_VERSION
 #error CUDART_VERSION Undefined!

@@ -1,5 +1,5 @@
 #include "rtp_llm/cpp/devices/cuda_impl/CudaDevice.h"
-#include "nvToolsExt.h"
+#include <nvtx3/nvToolsExt.h>
 
 namespace rtp_llm {
 void CudaDevice::perfRangePush(const std::string& name) const {

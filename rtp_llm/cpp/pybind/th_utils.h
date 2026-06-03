@@ -28,7 +28,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#include <nvToolsExt.h>
+#include <nvtx3/nvToolsExt.h>
 #endif
 #if USING_ROCM
 #include <hip/hip_runtime.h>
