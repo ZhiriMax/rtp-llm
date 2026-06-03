@@ -155,6 +155,12 @@ def git_deps():
         ],
     )
 
+    native.new_local_repository(
+        name = "nvshmem",
+        path = "/",
+        build_file = str(Label("//3rdparty/nvshmem:nvshmem.BUILD")),
+    )
+
     new_git_repository(
         name = "deep_ep",
         remote = "git@gitlab.alibaba-inc.com:foundation_models/DeepEP.git",
