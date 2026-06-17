@@ -2,14 +2,28 @@ load("//:def.bzl", "copts")
 load("@arch_config//:arch_select.bzl", "requirement", "whl_deps")
 
 cc_library(
+    name = "embedding_gather_layout",
+    hdrs = [
+        "EmbeddingGatherLayout.h",
+    ],
+    srcs = [
+        "EmbeddingGatherLayout.cc",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
     name = "embedding_engine",
     hdrs = glob([
         "*.h",
     ]),
     srcs = glob([
         "*.cc",
+    ], exclude = [
+        "EmbeddingGatherLayout.cc",
     ]),
     deps = [
+        ":embedding_gather_layout",
         "//rtp_llm/cpp/engine_base:engine_base",
         "//rtp_llm/cpp/engine_base:executor",
         "//rtp_llm/cpp/engine_base/stream:generate_config",

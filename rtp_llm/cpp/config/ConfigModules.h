@@ -337,6 +337,13 @@ struct FIFOSchedulerConfig {
     std::string to_string() const;
 };
 
+inline constexpr const char* kEmbeddingKVCacheModeOff     = "off";
+inline constexpr const char* kEmbeddingKVCacheModeBlock   = "block";
+inline constexpr const char* kEmbeddingKVCacheModeInBatch = "in_batch";
+
+inline constexpr const char* kEmbeddingKVCacheCommitPolicyPrefixBlock = "prefix_block";
+inline constexpr const char* kEmbeddingKVCacheCommitPolicyFullBlock   = "full_block";
+
 struct RuntimeConfig {
     int64_t max_generate_batch_size = 1;
 
@@ -357,6 +364,9 @@ struct RuntimeConfig {
 
     // Fields merged from PyDeviceResourceConfig
     std::string specify_gpu_arch = "";
+
+    std::string embedding_kv_cache_mode          = kEmbeddingKVCacheModeOff;
+    std::string embedding_kv_cache_commit_policy = kEmbeddingKVCacheCommitPolicyPrefixBlock;
 
     std::string to_string() const;
 };

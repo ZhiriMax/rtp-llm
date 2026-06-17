@@ -1,4 +1,6 @@
 #include "rtp_llm/cpp/embedding_engine/EmbeddingEngine.h"
+#include "rtp_llm/cpp/cache/CacheConfigCreator.h"
+#include "rtp_llm/cpp/cache/KVCacheManager.h"
 #include "rtp_llm/models_py/bindings/core/ExecOps.h"
 #include "rtp_llm/models_py/bindings/NoBlockCopy.h"
 #include "rtp_llm/cpp/utils/StatusUtil.h"
@@ -9,6 +11,39 @@
 
 using namespace std;
 namespace rtp_llm {
+
+namespace {
+
+bool enableEmbeddingKVCache(const RuntimeConfig& runtime_config) {
+    return runtime_config.embedding_kv_cache_mode == kEmbeddingKVCacheModeBlock
+           || runtime_config.embedding_kv_cache_mode == kEmbeddingKVCacheModeInBatch;
+}
+
+bool supportEmbeddingKVCache(const ModelConfig& model_config, const CacheConfig& cache_config, std::string& reason) {
+    if (cache_config.groupNums() != 1) {
+        reason = "hybrid cache groups are not supported yet";
+        return false;
+    }
+    if (cache_config.group_types.empty() || cache_config.group_types[0] != CacheGroupType::FULL) {
+        reason = "linear cache groups are not supported yet";
+        return false;
+    }
+    if (cache_config.use_mla || model_config.attn_config.use_mla) {
+        reason = "MLA cache layout is not supported yet";
+        return false;
+    }
+    if (!model_config.attn_config.is_causal) {
+        reason = "non-causal attention cannot safely reuse prefix KV";
+        return false;
+    }
+    if (!model_config.attn_config.need_rope_kv_cache) {
+        reason = "attention path does not write KV cache before attention";
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
 
 EmbeddingEngine::EmbeddingEngine(const EngineInitParams& params, py::object handler):
     model_config_(params.model_config_),
@@ -26,7 +61,29 @@ EmbeddingEngine::EmbeddingEngine(const EngineInitParams& params, py::object hand
                              params.model_config_.mla_ops_type);
     }
     warmupNoBlockCopy();
-    executor_.reset(new EmbeddingExecutor(params, handler));
+    if (enableEmbeddingKVCache(params.runtime_config)) {
+        auto cache_config = CacheConfigCreator::createConfig(
+            model_config_, parallelism_config, params.runtime_config, params.kv_cache_config, std::nullopt);
+        std::string unsupported_reason;
+        if (!supportEmbeddingKVCache(model_config_, cache_config, unsupported_reason)) {
+            RTP_LLM_LOG_WARNING("embedding kv cache mode %s fallback to off: %s",
+                                params.runtime_config.embedding_kv_cache_mode.c_str(),
+                                unsupported_reason.c_str());
+        } else {
+            RTP_LLM_LOG_INFO("create embedding cache manager with config %s", cache_config.debugString().c_str());
+            resource_context_.cache_manager = std::make_shared<KVCacheManager>(
+                cache_config,
+                false,
+                metrics_reporter_,
+                params.kv_cache_config,
+                parallelism_config,
+                params.runtime_config);
+            if (!resource_context_.cache_manager->init()) {
+                RTP_LLM_FAIL("init embedding kv cache manager failed");
+            }
+        }
+    }
+    executor_.reset(new EmbeddingExecutor(params, handler, resource_context_.cache_manager));
     scheduler_.reset(
         new EmbeddingScheduler(model_config_, concurrency_config, params.runtime_config, metrics_reporter_));
 
