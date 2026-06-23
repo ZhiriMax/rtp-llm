@@ -14,7 +14,7 @@ namespace rtp_llm {
 
 namespace {
 
-constexpr int         kTimelineSyncProfileSteps = 3;
+constexpr int         kTimelineSyncProfileSteps = 1;
 constexpr const char* kEmbeddingTimelineSyncTraceName = "embedding_timeline_sync";
 
 bool enableEmbeddingKVCache(const RuntimeConfig& runtime_config) {
