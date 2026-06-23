@@ -164,7 +164,6 @@ absl::Status EmbeddingEngine::step() {
         RTP_LLM_LOG_INFO("no query run and sleep");
         return absl::OkStatus();
     }
-    step_profiler_.tick();
     if (gen_timeline_sync_ && !step_profiler_.enabled()) {
         step_profiler_.configure(true, kEmbeddingTimelineSyncTraceName, 0, kTimelineSyncProfileSteps);
         step_profiler_.tick();
@@ -191,6 +190,7 @@ absl::Status EmbeddingEngine::step() {
         }
     }
     cudaSyncAndCheck();
+    step_profiler_.tick();
     return absl::OkStatus();
 }
 
