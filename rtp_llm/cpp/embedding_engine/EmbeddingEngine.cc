@@ -14,6 +14,9 @@ namespace rtp_llm {
 
 namespace {
 
+constexpr int         kTimelineSyncProfileSteps = 3;
+constexpr const char* kEmbeddingTimelineSyncTraceName = "embedding_timeline_sync";
+
 bool enableEmbeddingKVCache(const RuntimeConfig& runtime_config) {
     return runtime_config.embedding_kv_cache_mode == kEmbeddingKVCacheModeBlock
            || runtime_config.embedding_kv_cache_mode == kEmbeddingKVCacheModeInBatch;
@@ -52,7 +55,8 @@ EmbeddingEngine::EmbeddingEngine(const EngineInitParams& params, py::object hand
     metrics_reporter_(params.metrics_reporter),
     step_profiler_(params.profiling_debug_logging_config.torch_cuda_profiler_dir,
                    params.parallelism_config.dp_rank * params.parallelism_config.tp_size
-                       + params.parallelism_config.tp_rank) {
+                       + params.parallelism_config.tp_rank),
+    gen_timeline_sync_(params.profiling_debug_logging_config.gen_timeline_sync) {
     {
         size_t device_id = params.parallelism_config.world_rank % params.parallelism_config.local_world_size;
         rtp_llm::initRuntime(device_id,
@@ -161,6 +165,10 @@ absl::Status EmbeddingEngine::step() {
         return absl::OkStatus();
     }
     step_profiler_.tick();
+    if (gen_timeline_sync_ && !step_profiler_.enabled()) {
+        step_profiler_.configure(true, kEmbeddingTimelineSyncTraceName, 0, kTimelineSyncProfileSteps);
+        step_profiler_.tick();
+    }
     try {
         auto status = executor_->process(streams);
         if (!status.ok()) {

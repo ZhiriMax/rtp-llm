@@ -66,6 +66,7 @@ private:
     ResourceContext                     resource_context_;
     kmonitor::MetricsReporterPtr        metrics_reporter_ = nullptr;
     StepWindowProfiler                  step_profiler_;
+    bool                                gen_timeline_sync_ = false;
 };
 
 }  // namespace rtp_llm
