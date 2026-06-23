@@ -1,4 +1,4 @@
-from typing import Any, Optional
+from typing import Any, Optional, Tuple, Union
 
 import torch
 from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
@@ -389,11 +389,17 @@ class PyFlashinferPrefillAttnOp(object):
             or attn_inputs.prefix_lengths.sum().item() == 0
         )
 
-    ## 1. pure prefill attn: qkv contains q and k,v
+    ## 1. pure prefill attn: qkv contains q and k,v, or is a pre-split (q, k, v) tuple
     ## 2. paged attn: qkv is only q, and kv is in kv_cache
     def forward(
-        self, qkv: torch.Tensor, kv_cache: Optional[LayerKVCache]
+        self,
+        qkv: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+        kv_cache: Optional[LayerKVCache],
     ) -> torch.Tensor:
+        if isinstance(qkv, tuple):
+            q, k, v = qkv
+            return self.prefill_wrapper.run(q, k, v)
+
         qkv = qkv.reshape(qkv.shape[0], -1)
         q, k, v = torch.split(
             qkv,
@@ -437,6 +443,13 @@ class PyFlashinferPrefillImplBase(FMHAImplBase):
             num_kv_heads=attn_configs.kv_head_num,
             head_size=attn_configs.size_per_head,
             token_per_block=attn_configs.kernel_tokens_per_block,
+        )
+        self.no_cache_ragged_prefill = (
+            isinstance(self.fmha_impl, PyFlashinferPrefillAttnOp)
+            and (
+                attn_inputs.prefix_lengths.numel() <= 0
+                or attn_inputs.prefix_lengths.sum().item() == 0
+            )
         )
         self.create_params(attn_inputs)
         self.fmha_impl.prepare(attn_inputs)
@@ -518,11 +531,19 @@ class PyFlashinferPrefillImplBase(FMHAImplBase):
                 # No RoPE, just split QKV
                 query, key, value = self._split_qkv(qkv)
 
-            # Write KV to cache
-            self.kv_cache_write_op.forward(key, value, kv_cache)
+            # Real paged-cache paths need KV appended before attention. In cache-off
+            # ragged prefill there is no cache to write, so avoid the dummy paged
+            # append path and feed the already split tensors directly to FlashInfer.
+            if kv_cache is not None or not self.no_cache_ragged_prefill:
+                self.kv_cache_write_op.forward(key, value, kv_cache)
 
-            # Pass query to FMHA (for paged) or reconstruct qkv (for ragged)
-            qkv = self._prepare_fmha_input(query, key, value)
+            # Pass pre-split Q/K/V directly in cache-off ragged prefill to avoid
+            # re-packing them only for PyFlashinferPrefillAttnOp to split again.
+            if kv_cache is None and self.no_cache_ragged_prefill:
+                qkv = (query, key, value)
+            else:
+                # Pass query to FMHA (for paged) or reconstruct qkv (for ragged)
+                qkv = self._prepare_fmha_input(query, key, value)
 
         # Apply write cache store if needed
         common.apply_write_cache_store(
