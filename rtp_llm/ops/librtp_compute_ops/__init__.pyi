@@ -181,6 +181,7 @@ class PyAttentionInputs:
     combo_position_ids: torch.Tensor
     context_parallel_info: PyContextParallelParams | None
     context_total_kv_length: int
+    max_kv_seqlen: int
     cu_kv_seqlens: torch.Tensor
     cu_seqlens: torch.Tensor
     decode_cu_seqlens_d: torch.Tensor

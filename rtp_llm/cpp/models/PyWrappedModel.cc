@@ -141,6 +141,7 @@ torch_ext::PyAttentionInputs PyWrappedModel::buildPyAttentionInputs(const GptMod
             py_attn_inputs.input_lengths.add(py_attn_inputs.prefix_lengths).cumsum(0);
 
         py_attn_inputs.context_total_kv_length = cu_kv_seqlens[context_batch_size].item<int>();
+        py_attn_inputs.max_kv_seqlen           = cu_kv_seqlens[context_batch_size].item<int>();
         py_attn_inputs.total_tokens            = cu_seqlens[batch_size].item<int>();
         py_attn_inputs.cu_seqlens_host         = cu_seqlens;
         py_attn_inputs.cu_seqlens              = tensorHoldHostAndToCuda(cu_seqlens);
