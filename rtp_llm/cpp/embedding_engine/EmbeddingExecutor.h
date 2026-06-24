@@ -74,6 +74,10 @@ private:
     bool                            enable_in_batch_kv_prefix_dedup_ = false;
     bool                            allow_in_batch_kv_prefix_dedup_  = false;
 
+    // Pre-cached constant pinned tensors (invariant across batches)
+    torch::Tensor                   cached_kv_cache_layer_to_group_;
+    torch::Tensor                   cached_kv_cache_group_types_;
+
     ModelRequest                        generateOldModelRequest(GptModelInputs& model_input);
     absl::StatusOr<EmbeddingModelInput> gatherModelInput(const std::list<EmbeddingStreamPtr>& streams) const;
     absl::StatusOr<GptModelInputs>      gatherLegacyModelInput(const std::list<EmbeddingStreamPtr>& streams) const;

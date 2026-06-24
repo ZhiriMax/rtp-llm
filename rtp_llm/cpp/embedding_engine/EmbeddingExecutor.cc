@@ -151,6 +151,28 @@ EmbeddingExecutor::EmbeddingExecutor(const EngineInitParams&                para
     model_.reset(new PyWrappedModel(model_init_params, params.py_model, true));
 
     init_position_ids(model_config_.max_seq_len);
+
+    // Pre-cache constant pinned tensors for kv_cache_layer_to_group and kv_cache_group_types
+    if (cache_manager_) {
+        auto layer_to_group_vec = toInt32Vector(cache_config.layer_to_group_id);
+        cached_kv_cache_layer_to_group_ =
+            torch::from_blob(
+                layer_to_group_vec.data(), {static_cast<int64_t>(layer_to_group_vec.size())}, torch::kInt32)
+                .clone()
+                .pin_memory();
+
+        std::vector<int32_t> group_types_vec;
+        group_types_vec.reserve(cache_config.group_types.size());
+        for (auto group_type : cache_config.group_types) {
+            group_types_vec.push_back(static_cast<int32_t>(group_type));
+        }
+        cached_kv_cache_group_types_ =
+            torch::from_blob(
+                group_types_vec.data(), {static_cast<int64_t>(group_types_vec.size())}, torch::kInt32)
+                .clone()
+                .pin_memory();
+    }
+
     std::vector<std::string> handler_args;
     {
         py::gil_scoped_acquire acquire;
@@ -386,20 +408,8 @@ EmbeddingExecutor::gatherKVCacheModelInput(const std::list<EmbeddingStreamPtr>& 
                                                              static_cast<int64_t>(max_blocks_num)},
                                                             i32_options);
 
-        auto layer_to_group = toInt32Vector(cache_config.layer_to_group_id);
-        result.model_input.kv_cache_layer_to_group =
-            torch::from_blob(layer_to_group.data(), {static_cast<int64_t>(layer_to_group.size())}, torch::kInt32)
-                .clone()
-                .pin_memory();
-        std::vector<int32_t> group_types;
-        group_types.reserve(cache_config.group_types.size());
-        for (auto group_type : cache_config.group_types) {
-            group_types.push_back(static_cast<int32_t>(group_type));
-        }
-        result.model_input.kv_cache_group_types =
-            torch::from_blob(group_types.data(), {static_cast<int64_t>(group_types.size())}, torch::kInt32)
-                .clone()
-                .pin_memory();
+        result.model_input.kv_cache_layer_to_group = cached_kv_cache_layer_to_group_;
+        result.model_input.kv_cache_group_types    = cached_kv_cache_group_types_;
     }
 
     auto copy_blocks_to_model_input = [&](const BatchKVCacheResourcePtr& resource,

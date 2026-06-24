@@ -84,10 +84,14 @@ torch_ext::PyAttentionInputs PyWrappedModel::buildPyAttentionInputs(const GptMod
     py_attn_inputs.input_lengths    = inputs.input_lengths;
 
     if (inputs.kv_cache_kernel_block_id.defined()) {
-        py_attn_inputs.kv_cache_kernel_block_id_host = inputs.kv_cache_kernel_block_id.clone().pin_memory();
+        py_attn_inputs.kv_cache_kernel_block_id_host = inputs.kv_cache_kernel_block_id.is_pinned()
+                                                           ? inputs.kv_cache_kernel_block_id
+                                                           : inputs.kv_cache_kernel_block_id.clone().pin_memory();
     }
     if (inputs.kv_cache_block_id.defined()) {
-        py_attn_inputs.kv_cache_block_id_host = inputs.kv_cache_block_id.clone().pin_memory();
+        py_attn_inputs.kv_cache_block_id_host = inputs.kv_cache_block_id.is_pinned()
+                                                    ? inputs.kv_cache_block_id
+                                                    : inputs.kv_cache_block_id.clone().pin_memory();
     }
     if (inputs.kv_cache_layer_to_group.defined()) {
         py_attn_inputs.kv_cache_layer_to_group = inputs.kv_cache_layer_to_group;
@@ -213,14 +217,14 @@ torch_ext::BertEmbeddingInputs PyWrappedModel::buildBertEmbeddingInputs(const Gp
 
     // Convert combo_position_ids from Buffer to torch::Tensor
     if (inputs.combo_position_ids.defined()) {
-        bert_embedding_inputs.combo_position_ids = inputs.combo_position_ids.cuda();
+        bert_embedding_inputs.combo_position_ids = tensorHoldHostAndToCuda(inputs.combo_position_ids);
     }
 
     // Convert combo_tokens_type_ids from Buffer to torch::Tensor
     if (inputs.combo_tokens_type_ids.defined()) {
         {
             DevicePerfWrapper wrapper(enable_device_perf_, "py model combo_tokens.cuda()");
-            bert_embedding_inputs.combo_tokens_type_ids = inputs.combo_tokens_type_ids.cuda();
+            bert_embedding_inputs.combo_tokens_type_ids = tensorHoldHostAndToCuda(inputs.combo_tokens_type_ids);
         }
     }
 
@@ -421,10 +425,10 @@ torch_ext::PyEmbeddingInputs PyWrappedModel::buildPyEmbeddingInputs(const GptMod
     DevicePerfWrapper            wrapper(enable_device_perf_, "py model buildPyEmbeddingInputs");
     torch_ext::PyEmbeddingInputs embedding_inputs;
     if (inputs.combo_tokens_type_ids.defined()) {
-        embedding_inputs.combo_tokens_type_ids = inputs.combo_tokens_type_ids.cuda();
+        embedding_inputs.combo_tokens_type_ids = tensorHoldHostAndToCuda(inputs.combo_tokens_type_ids);
     }
     if (inputs.text_tokens_mask.defined()) {
-        embedding_inputs.text_tokens_mask = inputs.text_tokens_mask.cuda();
+        embedding_inputs.text_tokens_mask = tensorHoldHostAndToCuda(inputs.text_tokens_mask);
     }
     return embedding_inputs;
 }
