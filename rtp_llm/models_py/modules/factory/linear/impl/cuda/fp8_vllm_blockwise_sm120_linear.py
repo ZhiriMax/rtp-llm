@@ -62,7 +62,19 @@ def _m_bucket(m: int) -> str:
         return "129-256"
     if m <= 512:
         return "257-512"
-    return "513+"
+    if m <= 768:
+        return "513-768"
+    if m <= 1024:
+        return "769-1024"
+    if m <= 1536:
+        return "1025-1536"
+    if m <= 2048:
+        return "1537-2048"
+    if m <= 3072:
+        return "2049-3072"
+    if m <= 4096:
+        return "3073-4096"
+    return "4097+"
 
 
 def _projection_name(k: int, n: int) -> str:
