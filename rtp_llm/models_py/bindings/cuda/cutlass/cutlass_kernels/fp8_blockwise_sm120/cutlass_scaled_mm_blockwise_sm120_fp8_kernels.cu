@@ -332,8 +332,7 @@ void launch_one(torch::Tensor&       D,
     CUTLASS_CHECK(gemm_op.run(args, workspace.data_ptr(), stream));
 }
 
-// M-tier dispatch + M<=64 swap-AB heuristic (verbatim from vllm
-// cutlass_gemm_blockwise_sm120_fp8_dispatch).
+// M-tier dispatch + M<=64 swap-AB heuristic.
 template<typename OutType>
 void dispatch_blockwise_sm120(torch::Tensor&       D,
                               torch::Tensor const& A,
@@ -345,7 +344,7 @@ void dispatch_blockwise_sm120(torch::Tensor&       D,
                               int                  N,
                               int                  K,
                               cudaStream_t         stream) {
-    bool swap_ab = (M <= 64) || (M % 4 != 0);
+    bool swap_ab = (M <= 64);
     if (!swap_ab) {
         if (M <= 256) {
             launch_one<typename sm120_blockwise_fp8_config_pingpong<OutType>::Gemm>(

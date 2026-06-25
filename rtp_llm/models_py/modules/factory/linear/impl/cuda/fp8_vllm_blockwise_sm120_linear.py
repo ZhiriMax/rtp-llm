@@ -90,7 +90,7 @@ def _projection_name(k: int, n: int) -> str:
 
 
 def _selected_sm120_config(m: int) -> str:
-    if m <= 64 or m % 4 != 0:
+    if m <= 64:
         return "swap_ab"
     if m <= 256:
         return "pingpong"
