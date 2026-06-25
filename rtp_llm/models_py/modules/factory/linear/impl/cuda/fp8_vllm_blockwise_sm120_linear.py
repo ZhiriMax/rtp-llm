@@ -6,6 +6,9 @@ Selected by LinearFactory only when `is_sm12x()` is true; sm_9x / sm_10x
 keep using DeepGEMM via `CudaFp8GEMMLinear`.
 """
 
+import logging
+import os
+from collections import Counter
 from typing import Optional
 
 import torch
@@ -19,6 +22,94 @@ if is_cuda() and is_sm12x():
     from rtp_llm.ops.compute_ops import cutlass_scaled_mm_blockwise_sm120_fp8
 else:
     cutlass_scaled_mm_blockwise_sm120_fp8 = None
+
+
+_FP8_GEMM_SHAPE_TELEMETRY_ENABLED = (
+    os.environ.get("ENABLE_FP8_GEMM_SHAPE_TELEMETRY", "0") == "1"
+)
+_FP8_GEMM_SHAPE_COUNTER = Counter()
+_FP8_GEMM_SHAPE_TOTAL = 0
+
+
+def _get_positive_int_env(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return max(1, int(value))
+    except ValueError:
+        logging.warning("Invalid %s=%r, fallback to %d", name, value, default)
+        return default
+
+
+_FP8_GEMM_SHAPE_TELEMETRY_INTERVAL = _get_positive_int_env(
+    "FP8_GEMM_SHAPE_TELEMETRY_INTERVAL", 1000
+)
+
+
+def _m_bucket(m: int) -> str:
+    if m <= 8:
+        return "1-8"
+    if m <= 16:
+        return "9-16"
+    if m <= 32:
+        return "17-32"
+    if m <= 64:
+        return "33-64"
+    if m <= 128:
+        return "65-128"
+    if m <= 256:
+        return "129-256"
+    if m <= 512:
+        return "257-512"
+    return "513+"
+
+
+def _projection_name(k: int, n: int) -> str:
+    if k == 896 and n == 1152:
+        return "qkv"
+    if k == 896 and n == 896:
+        return "o_proj"
+    if k == 896 and n == 9728:
+        return "gate_up"
+    if k == 4864 and n == 896:
+        return "down"
+    return f"unknown_{k}x{n}"
+
+
+def _selected_sm120_config(m: int) -> str:
+    if m <= 64 or m % 4 != 0:
+        return "swap_ab"
+    if m <= 256:
+        return "pingpong"
+    return "default"
+
+
+def _record_fp8_gemm_shape(m: int, k: int, n: int) -> None:
+    if not _FP8_GEMM_SHAPE_TELEMETRY_ENABLED:
+        return
+
+    global _FP8_GEMM_SHAPE_TOTAL
+    projection = _projection_name(k, n)
+    selected_config = _selected_sm120_config(m)
+    key = (projection, _m_bucket(m), k, n, selected_config)
+    _FP8_GEMM_SHAPE_COUNTER[key] += 1
+    _FP8_GEMM_SHAPE_TOTAL += 1
+
+    if _FP8_GEMM_SHAPE_TOTAL % _FP8_GEMM_SHAPE_TELEMETRY_INTERVAL != 0:
+        return
+
+    top_buckets = _FP8_GEMM_SHAPE_COUNTER.most_common(20)
+    summary = "; ".join(
+        f"projection={projection},m_bucket={m_bucket},k={k},n={n},"
+        f"config={config},count={count}"
+        for (projection, m_bucket, k, n, config), count in top_buckets
+    )
+    logging.info(
+        "fp8_gemm_shape_telemetry total=%d top=%s",
+        _FP8_GEMM_SHAPE_TOTAL,
+        summary,
+    )
 
 
 class CudaFp8VllmBlockwiseLinear(LinearBase):
@@ -133,6 +224,7 @@ class CudaFp8VllmBlockwiseLinear(LinearBase):
             raise ValueError(
                 f"Input tensor inner dimension expected to be {self.K}, got {K}"
             )
+        _record_fp8_gemm_shape(M, K, self.N)
 
         input_fp8, input_scales = sgl_per_token_group_quant_fp8(
             input,
