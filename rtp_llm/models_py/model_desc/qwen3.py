@@ -1,3 +1,4 @@
+import os
 from typing import Any, Dict, Optional
 
 import torch
@@ -17,6 +18,10 @@ from rtp_llm.models_py.modules import (
 from rtp_llm.ops import HWKernelConfig, ParallelismConfig
 from rtp_llm.ops.compute_ops import LayerKVCache, PyModelInputs, PyModelOutputs
 from rtp_llm.utils.model_weight import W
+
+_ENABLE_DENSE_RMSNORM_QUANT_FUSION = (
+    os.environ.get("ENABLE_DENSE_RMSNORM_QUANT_FUSION", "0") == "1"
+)
 
 
 class Qwen3DecoderLayer(nn.Module):
@@ -54,6 +59,16 @@ class Qwen3DecoderLayer(nn.Module):
             weights[W.post_ln_gamma], eps=config.layernorm_eps
         )
 
+    def _maybe_quantize_rmsnorm(
+        self, consumer: nn.Module, rmsnorm: nn.Module, hidden_states: torch.Tensor
+    ):
+        if not _ENABLE_DENSE_RMSNORM_QUANT_FUSION:
+            return None
+        quantize_input = getattr(consumer, "quantize_rmsnorm_input", None)
+        if quantize_input is None:
+            return None
+        return quantize_input(rmsnorm, hidden_states)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -61,7 +76,14 @@ class Qwen3DecoderLayer(nn.Module):
         kv_cache: Optional[LayerKVCache] = None,
     ) -> torch.Tensor:
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        quantized_states = self._maybe_quantize_rmsnorm(
+            self.self_attn, self.input_layernorm, hidden_states
+        )
+        hidden_states = (
+            quantized_states
+            if quantized_states is not None
+            else self.input_layernorm(hidden_states)
+        )
         # Self Attention
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
@@ -72,7 +94,14 @@ class Qwen3DecoderLayer(nn.Module):
 
         # Fully Connected
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        quantized_states = self._maybe_quantize_rmsnorm(
+            self.mlp, self.post_attention_layernorm, hidden_states
+        )
+        hidden_states = (
+            quantized_states
+            if quantized_states is not None
+            else self.post_attention_layernorm(hidden_states)
+        )
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 

@@ -12,6 +12,8 @@ from rtp_llm.models_py.kernels.cuda.fp8_kernel import (
     requant_weight_ue8m0,
     sgl_per_token_group_quant_fp8,
 )
+from rtp_llm.models_py.modules.base import FusedSiluAndMul, RMSNorm
+from rtp_llm.models_py.modules.base.common.norm import RMSNormTorch
 from rtp_llm.models_py.modules.factory.linear import LinearFactory
 from rtp_llm.models_py.modules.factory.linear.impl.cuda.fp8_deepgemm_linear import (
     CudaFp8DeepGEMMLinear,
@@ -25,6 +27,9 @@ from rtp_llm.models_py.modules.factory.linear.impl.cuda.fp8_gemm_linear import (
 from rtp_llm.models_py.modules.factory.linear.impl.cuda.fp8_vllm_blockwise_sm120_linear import (
     CudaFp8VllmBlockwiseLinear,
     cutlass_scaled_mm_blockwise_sm120_fp8,
+)
+from rtp_llm.models_py.modules.fusion.quant_activation import (
+    QuantizedActivation,
 )
 from rtp_llm.test.utils.bench_util import bench
 from rtp_llm.test.utils.numeric_util import calc_diff, per_block_cast_to_fp8
@@ -1116,6 +1121,104 @@ class CudaFp8VllmBlockwiseSM120BoundaryTest(unittest.TestCase):
         output = linear(input_tensor)
         self.assertEqual(output.shape, (self.M, self.N))
         self.assertEqual(output.device.type, "cuda")
+
+    def test_fused_silu_and_mul_quantized_activation(self):
+        weight = torch.randn(
+            self.K, self.N, dtype=torch.float32, device=self.device
+        ).to(torch.float8_e4m3fn)
+        weight_scales = torch.rand(
+            (self.K + 127) // 128,
+            (self.N + 127) // 128,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        linear = CudaFp8VllmBlockwiseLinear(weight, weight_scales)
+        gate_up = torch.randn(
+            self.M, self.K * 2, dtype=torch.bfloat16, device=self.device
+        ).contiguous()
+
+        quantized = linear.quantize_fused_silu_and_mul(gate_up)
+        self.assertIsInstance(quantized, QuantizedActivation)
+        self.assertEqual(quantized.data.shape, (self.M, self.K))
+        self.assertEqual(quantized.data.dtype, torch.float8_e4m3fn)
+        self.assertEqual(quantized.scale.shape, (self.M, self.K // 128))
+        self.assertEqual(quantized.scale.dtype, torch.float32)
+        self.assertEqual(quantized.orig_dtype, torch.bfloat16)
+        self.assertEqual(quantized.orig_shape, torch.Size((self.M, self.K)))
+        self.assertEqual(quantized.quant_key.scale.group_shape.col, 128)
+        self.assertTrue(quantized.scale_layout.column_major_scales)
+        self.assertFalse(quantized.scale_layout.scale_tma_aligned)
+        self.assertFalse(quantized.scale_layout.scale_ue8m0)
+        self.assertLess(quantized.scale.stride(-2), quantized.scale.stride(-1))
+
+        activated = FusedSiluAndMul()(gate_up)
+        ref_data, ref_scale = sgl_per_token_group_quant_fp8(
+            activated,
+            group_size=128,
+            eps=1e-4,
+            column_major_scales=True,
+            scale_tma_aligned=False,
+            scale_ue8m0=False,
+        )
+        quantized_deq = quantized.data.float() * quantized.scale.repeat_interleave(
+            128, dim=-1
+        )
+        ref_deq = ref_data.float() * ref_scale.repeat_interleave(128, dim=-1)
+        self.assertLess(calc_diff(quantized_deq, ref_deq), 0.003)
+
+        output = linear(quantized)
+        ref_output = linear(activated)
+        self.assertEqual(output.shape, (self.M, self.N))
+        self.assertLess(calc_diff(output, ref_output), 0.003)
+
+    def test_rmsnorm_quantized_activation(self):
+        weight = torch.randn(
+            self.K, self.N, dtype=torch.float32, device=self.device
+        ).to(torch.float8_e4m3fn)
+        weight_scales = torch.rand(
+            (self.K + 127) // 128,
+            (self.N + 127) // 128,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        linear = CudaFp8VllmBlockwiseLinear(weight, weight_scales)
+        rms_weight = torch.randn(self.K, dtype=torch.bfloat16, device=self.device)
+        rmsnorm = RMSNorm(rms_weight, eps=1e-6)
+        torch_rmsnorm = RMSNormTorch(rms_weight, eps=1e-6)
+        input_tensor = torch.randn(
+            self.M, self.K, dtype=torch.bfloat16, device=self.device
+        ).contiguous()
+
+        quantized = linear.quantize_rmsnorm(rmsnorm, input_tensor)
+        self.assertIsInstance(quantized, QuantizedActivation)
+        self.assertEqual(quantized.data.shape, (self.M, self.K))
+        self.assertEqual(quantized.data.dtype, torch.float8_e4m3fn)
+        self.assertEqual(quantized.scale.shape, (self.M, self.K // 128))
+        self.assertEqual(quantized.scale.dtype, torch.float32)
+        self.assertEqual(quantized.orig_shape, input_tensor.shape)
+        self.assertTrue(quantized.scale_layout.column_major_scales)
+
+        normed = rmsnorm(input_tensor)
+        torch_normed = torch_rmsnorm(input_tensor)
+        self.assertLess(calc_diff(normed, torch_normed), 0.003)
+        ref_data, ref_scale = sgl_per_token_group_quant_fp8(
+            normed,
+            group_size=128,
+            eps=1e-4,
+            column_major_scales=True,
+            scale_tma_aligned=False,
+            scale_ue8m0=False,
+        )
+        quantized_deq = quantized.data.float() * quantized.scale.repeat_interleave(
+            128, dim=-1
+        )
+        ref_deq = ref_data.float() * ref_scale.repeat_interleave(128, dim=-1)
+        self.assertLess(calc_diff(quantized_deq, ref_deq), 0.003)
+
+        output = linear(quantized)
+        ref_output = linear(normed)
+        self.assertEqual(output.shape, (self.M, self.N))
+        self.assertLess(calc_diff(output, ref_output), 0.003)
 
 
 CudaFp8DeepGEMMLinearTestBase = CudaFp8GEMMLinearTestBase

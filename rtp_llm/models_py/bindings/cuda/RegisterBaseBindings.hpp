@@ -11,6 +11,7 @@
 // RtpProcessGroup is deprecated, use rtp_llm.distribute.collective_torch instead
 // #include "rtp_llm/models_py/bindings/common/RtpProcessGroup.h"
 #include "rtp_llm/models_py/bindings/cuda/PerTokenGroupQuantFp8.h"
+#include "rtp_llm/models_py/bindings/cuda/RmsNormQuant.h"
 #include "3rdparty/flashinfer/flashinfer.h"
 #include "rtp_llm/models_py/bindings/cuda/TrtFp8QuantOp.h"
 #include "rtp_llm/models_py/bindings/cuda/ReuseKVCacheOp.h"
@@ -141,6 +142,19 @@ void registerBasicCudaOps(py::module& rtp_ops_m) {
                   py::arg("scale_ue8m0"),
                   py::arg("fuse_silu_and_mul"),
                   py::arg("masked_m"));
+
+    rtp_ops_m.def("rms_norm_per_block_quant_fp8",
+                  &rms_norm_per_block_quant_fp8,
+                  "RMSNorm + FP8 per block quant",
+                  py::arg("input"),
+                  py::arg("output_q"),
+                  py::arg("output_s"),
+                  py::arg("weight"),
+                  py::arg("group_size"),
+                  py::arg("rms_eps"),
+                  py::arg("quant_eps"),
+                  py::arg("fp8_min"),
+                  py::arg("fp8_max"));
 
     rtp_ops_m.def("embedding",
                   &embedding,

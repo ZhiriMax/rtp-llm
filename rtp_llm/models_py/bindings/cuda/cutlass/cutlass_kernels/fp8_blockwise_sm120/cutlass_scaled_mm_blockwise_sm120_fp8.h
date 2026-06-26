@@ -18,7 +18,7 @@
 //      N-stride=K) despite LayoutB=ColumnMajor in the template.
 //   A_sf: per-token-group scale, MN-major layout (output of
 //         sgl_per_token_group_quant_fp8 with column_major_scales=True,
-//         scale_tma_aligned=True)
+//         scale_tma_aligned=False)
 //   B_sf: per-block weight scale, K-major layout (shape (N/128, K/128) ->
 //         flattened consistently with cutlass Sm120BlockwiseScaleConfig)
 //   bias: optional per-output-channel bias (N,) same dtype as D. When present

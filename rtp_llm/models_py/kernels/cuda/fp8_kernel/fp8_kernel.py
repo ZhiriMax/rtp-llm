@@ -22,6 +22,7 @@ if is_cuda():
         per_token_group_quant_fp8_v2,
         per_token_group_quant_int8,
         per_token_quant_fp8,
+        rms_norm_per_block_quant_fp8 as rms_norm_per_block_quant_fp8_op,
     )
 else:
     logging.info("skip import fp8 quant from rtp_llm_ops for non cuda platform")
@@ -132,8 +133,15 @@ def sgl_per_token_group_quant_fp8(
         x.shape[-1] % group_size == 0
     ), "the last dimension of `x` cannot be divisible by `group_size`"
     assert x.is_contiguous(), "`x` is not contiguous"
+    assert (
+        masked_m is None or fuse_silu_and_mul
+    ), "masked_m is only supported with fused silu_and_mul quant"
 
     out_shape = (*x.shape[:-1], x.shape[-1] // (2 if fuse_silu_and_mul else 1))
+    if fuse_silu_and_mul:
+        assert (
+            out_shape[-1] % group_size == 0
+        ), "fused silu_and_mul output dimension must be divisible by `group_size`"
     x_q = torch.empty(out_shape, device=x.device, dtype=fp8_dtype)
     x_s = create_per_token_group_quant_fp8_output_scale(
         x_shape=out_shape,
@@ -146,6 +154,7 @@ def sgl_per_token_group_quant_fp8(
     if x.shape[0] > 0:
         if (
             masked_m is not None
+            or fuse_silu_and_mul
             or use_v2_fp8_group_quant(group_size)
         ):
             per_token_group_quant_fp8_v2(
@@ -165,6 +174,45 @@ def sgl_per_token_group_quant_fp8(
                 x, x_q, x_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
             )
 
+    return x_q, x_s
+
+
+def rms_norm_per_block_quant_fp8(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    rms_eps: float,
+    group_size: int,
+    quant_eps: float = 1e-10,
+    column_major_scales: bool = False,
+    scale_tma_aligned: bool = False,
+    scale_ue8m0: bool = False,
+):
+    assert not scale_ue8m0, "rms_norm_per_block_quant_fp8 does not support UE8M0 scales"
+    assert x.dim() == 2, "rms_norm_per_block_quant_fp8 expects a 2D input"
+    assert x.shape[-1] % group_size == 0, "input hidden size must be divisible by group_size"
+    assert x.is_contiguous(), "`x` is not contiguous"
+
+    x_q = torch.empty_like(x, dtype=fp8_dtype)
+    x_s = create_per_token_group_quant_fp8_output_scale(
+        x_shape=x.shape,
+        device=x.device,
+        group_size=group_size,
+        column_major_scales=column_major_scales,
+        scale_tma_aligned=scale_tma_aligned,
+        scale_ue8m0=scale_ue8m0,
+    )
+    if x.shape[0] > 0:
+        rms_norm_per_block_quant_fp8_op(
+            x,
+            x_q,
+            x_s,
+            weight,
+            group_size,
+            rms_eps,
+            quant_eps,
+            fp8_min,
+            fp8_max,
+        )
     return x_q, x_s
 
 

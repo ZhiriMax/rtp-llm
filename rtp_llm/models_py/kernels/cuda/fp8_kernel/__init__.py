@@ -9,6 +9,7 @@ from .fp8_kernel import (
     per_block_cast_to_fp8,
     per_token_cast_to_fp8,
     requant_weight_ue8m0,
+    rms_norm_per_block_quant_fp8,
     scaled_fp8_per_tensor_quant,
     scaled_fp8_per_token_quant,
     sgl_per_token_group_quant_fp8,
@@ -23,5 +24,6 @@ __all__ = [
     "per_token_cast_to_fp8",
     "per_block_cast_to_fp8",
     "requant_weight_ue8m0",
+    "rms_norm_per_block_quant_fp8",
     "create_per_token_group_quant_fp8_output_scale",
 ]

@@ -416,8 +416,17 @@ void sgl_per_token_group_quant_8bit_v2(
     const std::optional<torch::Tensor>& masked_m) {
     CHECK_INPUT(input);
     CHECK_INPUT(output_q);
+    CHECK_CUDA(output_s);
     TORCH_CHECK(input.numel() > 0);
 
+    TORCH_CHECK(group_size == 16 || group_size == 32 || group_size == 64 || group_size == 128,
+                "Unsupported group_size");
+    TORCH_CHECK(input.dim() >= 2);
+    TORCH_CHECK(output_q.dim() >= 2);
+    TORCH_CHECK(input.size(-2) == output_q.size(-2));
+    TORCH_CHECK(input.size(-1) == output_q.size(-1) * (fuse_silu_and_mul ? 2 : 1),
+                "input last dim must match output_q last dim");
+    TORCH_CHECK(output_q.size(-1) % group_size == 0, "output_q last dim must be divisible by group_size");
     CHECK_EQ(input.numel() % group_size, 0);
     const int num_groups = static_cast<int>(input.numel()) / group_size / (fuse_silu_and_mul ? 2 : 1);
 
@@ -425,6 +434,7 @@ void sgl_per_token_group_quant_8bit_v2(
     TORCH_CHECK(output_s.dim() == (masked_layout ? 3 : 2));
 
     const int num_local_experts = masked_layout ? input.size(0) : 1;
+    TORCH_CHECK(!masked_layout || fuse_silu_and_mul, "masked layout requires fuse_silu_and_mul");
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
@@ -432,6 +442,7 @@ void sgl_per_token_group_quant_8bit_v2(
 
     const bool is_column_major       = output_s.stride(-2) < output_s.stride(-1);
     const int  hidden_dim_num_groups = static_cast<int>(output_q.size(-1)) / group_size;
+    TORCH_CHECK(hidden_dim_num_groups > 0);
     const int  num_tokens_per_expert = static_cast<int>(output_q.size(-2));
     const int  scale_expert_stride   = masked_layout ? static_cast<int>(output_s.stride(0)) : 0;
     const int  scale_hidden_stride   = static_cast<int>(output_s.stride(-1));
@@ -504,10 +515,44 @@ void sgl_per_token_group_quant_8bit_v2(
                         NaiveScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, uint32_t, true, true);          \
                 }                                                                                                      \
             } else {                                                                                                   \
-                LAUNCH_KERNEL_INNER(NaiveScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, true);       \
+                if (fuse_silu_and_mul) {                                                                               \
+                    if (masked_layout) {                                                                               \
+                        LAUNCH_KERNEL_INNER(MaskedLayoutScheduler,                                                     \
+                                            GROUP_SIZE,                                                                \
+                                            THREADS_PER_SUBWARP,                                                       \
+                                            T,                                                                         \
+                                            DST_DTYPE,                                                                 \
+                                            float,                                                                     \
+                                            true,                                                                      \
+                                            false,                                                                     \
+                                            true);                                                                     \
+                    } else {                                                                                           \
+                        LAUNCH_KERNEL_INNER(                                                                           \
+                            NaiveScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, true, false, true);  \
+                    }                                                                                                  \
+                } else {                                                                                               \
+                    LAUNCH_KERNEL_INNER(NaiveScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, true);   \
+                }                                                                                                      \
             }                                                                                                          \
         } else {                                                                                                       \
-            LAUNCH_KERNEL_INNER(NaiveScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, false);          \
+            if (fuse_silu_and_mul) {                                                                                   \
+                if (masked_layout) {                                                                                   \
+                    LAUNCH_KERNEL_INNER(MaskedLayoutScheduler,                                                         \
+                                        GROUP_SIZE,                                                                    \
+                                        THREADS_PER_SUBWARP,                                                           \
+                                        T,                                                                             \
+                                        DST_DTYPE,                                                                     \
+                                        float,                                                                         \
+                                        false,                                                                         \
+                                        false,                                                                         \
+                                        true);                                                                         \
+                } else {                                                                                               \
+                    LAUNCH_KERNEL_INNER(                                                                               \
+                        NaiveScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, false, false, true);     \
+                }                                                                                                      \
+            } else {                                                                                                   \
+                LAUNCH_KERNEL_INNER(NaiveScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, false);      \
+            }                                                                                                          \
         }                                                                                                              \
     } while (0)
 

@@ -1,5 +1,6 @@
 """Unified dense MLP implementation supporting multiple activation types."""
 
+import os
 from typing import Dict, Optional, Type
 
 import torch
@@ -17,6 +18,9 @@ _ACTIVATION_FUNC_MAP: Dict[ActivationType, Type[nn.Module]] = {
 }
 
 _GATED_ACTIVATION_TYPE_LIST = [ActivationType.Swiglu]
+_ENABLE_DENSE_SILU_MUL_QUANT_FUSION = (
+    os.environ.get("ENABLE_DENSE_SILU_MUL_QUANT_FUSION", "0") == "1"
+)
 
 
 class DenseMLP(nn.Module):
@@ -92,10 +96,26 @@ class DenseMLP(nn.Module):
             input_scale_key=W.ffn_w2_i_s,
         )
 
+    def quantize_rmsnorm_input(
+        self, rmsnorm: nn.Module, hidden_states: torch.Tensor
+    ) -> Optional[object]:
+        quantize_rmsnorm = getattr(self.up_proj, "quantize_rmsnorm", None)
+        if quantize_rmsnorm is None:
+            return None
+        return quantize_rmsnorm(rmsnorm, hidden_states)
+
     def forward(self, x: torch.Tensor, skip_allreduce: bool = False) -> torch.Tensor:
         up = self.up_proj(x)
-        activated = self.act_fn(up)
-        output = self.down_proj(activated)
+        quantize_fused = getattr(self.down_proj, "quantize_fused_silu_and_mul", None)
+        if (
+            _ENABLE_DENSE_SILU_MUL_QUANT_FUSION
+            and self.is_gated
+            and quantize_fused is not None
+        ):
+            output = self.down_proj(quantize_fused(up))
+        else:
+            activated = self.act_fn(up)
+            output = self.down_proj(activated)
         if not skip_allreduce and self.parallelism_config.get_ffn_tp_size() > 1:
             output = all_reduce(output, group=Group.TP)
         return output

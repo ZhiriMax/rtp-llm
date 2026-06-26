@@ -74,6 +74,14 @@ class CausalAttention(nn.Module):
                 layernorm_eps,
             )
 
+    def quantize_rmsnorm_input(
+        self, rmsnorm: nn.Module, hidden_states: torch.Tensor
+    ) -> Optional[object]:
+        quantize_rmsnorm = getattr(self.qkv_proj, "quantize_rmsnorm", None)
+        if quantize_rmsnorm is None:
+            return None
+        return quantize_rmsnorm(rmsnorm, hidden_states)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -81,7 +89,10 @@ class CausalAttention(nn.Module):
         kv_cache: Optional[LayerKVCache],
         gate: Optional[torch.Tensor] = None,  # for qwen3 next
     ) -> torch.Tensor:
-        input_shape = hidden_states.shape[:-1]
+        if hasattr(hidden_states, "orig_shape"):
+            input_shape = hidden_states.orig_shape[:-1]
+        else:
+            input_shape = hidden_states.shape[:-1]
         qkv = self.qkv_proj(hidden_states)
         if self.qk_fuse_norm is not None:
             qkv = self.qk_fuse_norm(qkv)

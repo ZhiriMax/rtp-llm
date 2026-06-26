@@ -9,12 +9,23 @@ keep using DeepGEMM via `CudaFp8GEMMLinear`.
 import logging
 import os
 from collections import Counter
-from typing import Optional
+from typing import Optional, Protocol, Tuple, Union
 
 import torch
 
-from rtp_llm.models_py.kernels.cuda.fp8_kernel import sgl_per_token_group_quant_fp8
+from rtp_llm.models_py.kernels.cuda.fp8_kernel import (
+    rms_norm_per_block_quant_fp8,
+    sgl_per_token_group_quant_fp8,
+)
 from rtp_llm.models_py.modules.factory.linear import LinearBase
+from rtp_llm.models_py.modules.fusion.quant_activation import (
+    GroupShape,
+    QuantKey,
+    QuantizedActivation,
+    ScaleLayout,
+    ScaleDesc,
+    as_quantized_activation,
+)
 from rtp_llm.models_py.utils.arch import is_cuda, is_sm12x
 from rtp_llm.ops import HWKernelConfig
 
@@ -45,6 +56,22 @@ def _get_positive_int_env(name: str, default: int) -> int:
 _FP8_GEMM_SHAPE_TELEMETRY_INTERVAL = _get_positive_int_env(
     "FP8_GEMM_SHAPE_TELEMETRY_INTERVAL", 1000
 )
+_SM120_FP8_INPUT_QUANT_KEY = QuantKey(
+    dtype=torch.float8_e4m3fn,
+    scale=ScaleDesc(
+        dtype=torch.float32,
+        static=False,
+        group_shape=GroupShape(1, 128),
+    ),
+    symmetric=True,
+)
+_SM120_FP8_INPUT_SCALE_LAYOUT = ScaleLayout(
+    column_major_scales=True,
+    scale_tma_aligned=False,
+    scale_ue8m0=False,
+)
+_SM120_FP8_INPUT_GROUP_SIZE = _SM120_FP8_INPUT_QUANT_KEY.scale.group_shape.col
+_SM120_FP8_INPUT_EPS = 1e-4
 
 
 def _m_bucket(m: int) -> str:
@@ -77,18 +104,6 @@ def _m_bucket(m: int) -> str:
     return "4097+"
 
 
-def _projection_name(k: int, n: int) -> str:
-    if k == 896 and n == 1152:
-        return "qkv"
-    if k == 896 and n == 896:
-        return "o_proj"
-    if k == 896 and n == 9728:
-        return "gate_up"
-    if k == 4864 and n == 896:
-        return "down"
-    return f"unknown_{k}x{n}"
-
-
 def _selected_sm120_config(m: int) -> str:
     if m <= 64:
         return "swap_ab"
@@ -102,9 +117,8 @@ def _record_fp8_gemm_shape(m: int, k: int, n: int) -> None:
         return
 
     global _FP8_GEMM_SHAPE_TOTAL
-    projection = _projection_name(k, n)
     selected_config = _selected_sm120_config(m)
-    key = (projection, _m_bucket(m), k, n, selected_config)
+    key = (_m_bucket(m), k, n, selected_config)
     _FP8_GEMM_SHAPE_COUNTER[key] += 1
     _FP8_GEMM_SHAPE_TOTAL += 1
 
@@ -113,15 +127,19 @@ def _record_fp8_gemm_shape(m: int, k: int, n: int) -> None:
 
     top_buckets = _FP8_GEMM_SHAPE_COUNTER.most_common(20)
     summary = "; ".join(
-        f"projection={projection},m_bucket={m_bucket},k={k},n={n},"
-        f"config={config},count={count}"
-        for (projection, m_bucket, k, n, config), count in top_buckets
+        f"m_bucket={m_bucket},k={k},n={n},config={config},count={count}"
+        for (m_bucket, k, n, config), count in top_buckets
     )
     logging.info(
         "fp8_gemm_shape_telemetry total=%d top=%s",
         _FP8_GEMM_SHAPE_TOTAL,
         summary,
     )
+
+
+class _RMSNormLike(Protocol):
+    weight: torch.Tensor
+    variance_epsilon: float
 
 
 class CudaFp8VllmBlockwiseLinear(LinearBase):
@@ -224,30 +242,135 @@ class CudaFp8VllmBlockwiseLinear(LinearBase):
             if self.bias.dtype != torch.bfloat16:
                 raise ValueError(f"Bias dtype must be bfloat16, got {self.bias.dtype}")
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        if input.dtype != torch.bfloat16:
-            raise ValueError(f"Input tensor dtype must be bfloat16, got {input.dtype}")
-        if input.dim() != 2:
+    def _quantize_input(
+        self, input: torch.Tensor, fuse_silu_and_mul: bool = False
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return sgl_per_token_group_quant_fp8(
+            input,
+            group_size=_SM120_FP8_INPUT_GROUP_SIZE,
+            eps=_SM120_FP8_INPUT_EPS,
+            column_major_scales=_SM120_FP8_INPUT_SCALE_LAYOUT.column_major_scales,
+            scale_tma_aligned=_SM120_FP8_INPUT_SCALE_LAYOUT.scale_tma_aligned,
+            scale_ue8m0=_SM120_FP8_INPUT_SCALE_LAYOUT.scale_ue8m0,
+            fuse_silu_and_mul=fuse_silu_and_mul,
+        )
+
+    def quantize_fused_silu_and_mul(
+        self, gate_up: torch.Tensor
+    ) -> QuantizedActivation:
+        if gate_up.dtype != torch.bfloat16:
             raise ValueError(
-                f"Input tensor dimension must be 2, got {input.dim()}D tensor"
+                f"Input tensor dtype must be bfloat16, got {gate_up.dtype}"
             )
-        M, K = input.shape
+        if gate_up.dim() != 2:
+            raise ValueError(
+                f"Input tensor dimension must be 2, got {gate_up.dim()}D tensor"
+            )
+        if gate_up.shape[-1] != self.K * 2:
+            raise ValueError(
+                f"Fused SiLU input inner dimension expected to be {self.K * 2}, "
+                f"got {gate_up.shape[-1]}"
+            )
+        if self.K % _SM120_FP8_INPUT_GROUP_SIZE != 0:
+            raise ValueError(
+                f"Fused SiLU output dimension {self.K} must be divisible by "
+                f"group size {_SM120_FP8_INPUT_GROUP_SIZE}"
+            )
+        input_fp8, input_scales = self._quantize_input(
+            gate_up, fuse_silu_and_mul=True
+        )
+        return QuantizedActivation(
+            input_fp8,
+            input_scales,
+            gate_up.dtype,
+            torch.Size((gate_up.shape[0], self.K)),
+            _SM120_FP8_INPUT_QUANT_KEY,
+            _SM120_FP8_INPUT_SCALE_LAYOUT,
+        )
+
+    def quantize_rmsnorm(
+        self, rmsnorm: _RMSNormLike, hidden_states: torch.Tensor
+    ) -> QuantizedActivation:
+        if hidden_states.dtype != torch.bfloat16:
+            raise ValueError(
+                f"Input tensor dtype must be bfloat16, got {hidden_states.dtype}"
+            )
+        if hidden_states.dim() != 2:
+            raise ValueError(
+                f"Input tensor dimension must be 2, got {hidden_states.dim()}D tensor"
+            )
+        if hidden_states.shape[-1] != self.K:
+            raise ValueError(
+                f"Input tensor inner dimension expected to be {self.K}, got "
+                f"{hidden_states.shape[-1]}"
+            )
+        input_fp8, input_scales = rms_norm_per_block_quant_fp8(
+            hidden_states,
+            rmsnorm.weight.data,
+            rmsnorm.variance_epsilon,
+            group_size=_SM120_FP8_INPUT_GROUP_SIZE,
+            quant_eps=_SM120_FP8_INPUT_EPS,
+            column_major_scales=_SM120_FP8_INPUT_SCALE_LAYOUT.column_major_scales,
+            scale_tma_aligned=_SM120_FP8_INPUT_SCALE_LAYOUT.scale_tma_aligned,
+            scale_ue8m0=_SM120_FP8_INPUT_SCALE_LAYOUT.scale_ue8m0,
+        )
+        return QuantizedActivation(
+            input_fp8,
+            input_scales,
+            hidden_states.dtype,
+            hidden_states.shape,
+            _SM120_FP8_INPUT_QUANT_KEY,
+            _SM120_FP8_INPUT_SCALE_LAYOUT,
+        )
+
+    def _forward_quantized(
+        self, input_fp8: torch.Tensor, input_scales: torch.Tensor
+    ) -> torch.Tensor:
+        if input_fp8.dim() != 2:
+            raise ValueError(
+                f"Quantized input dimension must be 2, got {input_fp8.dim()}D tensor"
+            )
+        M, K = input_fp8.shape
         if K != self.K:
             raise ValueError(
-                f"Input tensor inner dimension expected to be {self.K}, got {K}"
+                f"Quantized input inner dimension expected to be {self.K}, got {K}"
+            )
+        if input_fp8.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                f"Quantized input dtype must be float8_e4m3fn, got {input_fp8.dtype}"
+            )
+        if input_scales.device != input_fp8.device:
+            raise ValueError(
+                f"Input scale device {input_scales.device} must match input device "
+                f"{input_fp8.device}"
+            )
+        if input_scales.dtype != torch.float32:
+            raise ValueError(
+                f"Input scale dtype must be float32, got {input_scales.dtype}"
+            )
+        expected_scale_shape = (M, K // _SM120_FP8_INPUT_GROUP_SIZE)
+        if input_scales.shape != expected_scale_shape:
+            raise ValueError(
+                f"Input scale shape expected to be {expected_scale_shape}, got "
+                f"{tuple(input_scales.shape)}"
+            )
+        if _SM120_FP8_INPUT_SCALE_LAYOUT.column_major_scales:
+            if input_scales.stride(-2) != 1 or input_scales.stride(-1) < M:
+                raise ValueError(
+                    "Column-major input scales must have token stride 1 and "
+                    "K-group stride at least M"
+                )
+        elif (
+            input_scales.stride(-1) != 1
+            or input_scales.stride(-2) < expected_scale_shape[-1]
+        ):
+            raise ValueError(
+                "Row-major input scales must have K-group stride 1 and token "
+                "stride at least K-group count"
             )
         _record_fp8_gemm_shape(M, K, self.N)
 
-        input_fp8, input_scales = sgl_per_token_group_quant_fp8(
-            input,
-            group_size=128,
-            eps=1e-4,
-            column_major_scales=True,
-            scale_tma_aligned=False,
-            scale_ue8m0=False,
-        )
-
-        output = torch.empty(M, self.N, dtype=torch.bfloat16, device=input.device)
+        output = torch.empty(M, self.N, dtype=torch.bfloat16, device=input_fp8.device)
         # Bias is fused into the GEMM epilogue (per-output-channel add) instead
         # of a separate elementwise add kernel.
         bias = None
@@ -262,3 +385,24 @@ class CudaFp8VllmBlockwiseLinear(LinearBase):
             bias,
         )
         return output
+
+    def forward(self, input: Union[torch.Tensor, QuantizedActivation]) -> torch.Tensor:
+        quantized = as_quantized_activation(
+            input, _SM120_FP8_INPUT_QUANT_KEY, _SM120_FP8_INPUT_SCALE_LAYOUT
+        )
+        if quantized is not None:
+            return self._forward_quantized(quantized.data, quantized.scale)
+
+        if input.dtype != torch.bfloat16:
+            raise ValueError(f"Input tensor dtype must be bfloat16, got {input.dtype}")
+        if input.dim() != 2:
+            raise ValueError(
+                f"Input tensor dimension must be 2, got {input.dim()}D tensor"
+            )
+        _, K = input.shape
+        if K != self.K:
+            raise ValueError(
+                f"Input tensor inner dimension expected to be {self.K}, got {K}"
+            )
+        input_fp8, input_scales = self._quantize_input(input)
+        return self._forward_quantized(input_fp8, input_scales)
