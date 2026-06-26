@@ -108,6 +108,7 @@ cc_library(
     deps = [
         "//rtp_llm/models_py/bindings/cuda:cuda_host_utils",
         "//rtp_llm/models_py/bindings/cuda:cuda_utils_cu",
+        "//rtp_llm/models_py/bindings/cuda:launch_utils",
         ":cuda_utils_common",
         "//rtp_llm/cpp/utils:core_utils",
     ] + torch_deps(),

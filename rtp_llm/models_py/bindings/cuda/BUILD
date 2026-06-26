@@ -51,6 +51,12 @@ cc_library(
     hdrs = [
         "launch_utils.h",
     ],
+    deps = select({
+        "@//:using_cuda": [
+            ":cuda_host_utils",
+        ],
+        "//conditions:default": [],
+    }),
     implementation_deps = [
         "//rtp_llm/cpp/config:config_modules",
         "//rtp_llm/cpp/config:static_config",

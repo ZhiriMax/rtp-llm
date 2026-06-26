@@ -33,6 +33,17 @@ finfo = torch.finfo(fp8_dtype)
 fp8_max = finfo.max
 fp8_min = -fp8_max
 
+_FP8_GROUP_QUANT_KERNEL_ENV = "FP8_GROUP_QUANT_KERNEL"
+_FP8_GROUP_QUANT_V2_SUPPORTED_GROUP_SIZES = (16, 32, 64, 128)
+_FP8_GROUP_QUANT_KERNEL = os.environ.get(_FP8_GROUP_QUANT_KERNEL_ENV, "v1")
+
+
+def use_v2_fp8_group_quant(group_size: int) -> bool:
+    return (
+        _FP8_GROUP_QUANT_KERNEL == "v2"
+        and group_size in _FP8_GROUP_QUANT_V2_SUPPORTED_GROUP_SIZES
+    )
+
 
 def ceil_div(x: int, y: int) -> int:
     return (x + y - 1) // y
@@ -133,7 +144,10 @@ def sgl_per_token_group_quant_fp8(
         scale_ue8m0=scale_ue8m0,
     )
     if x.shape[0] > 0:
-        if masked_m is not None:
+        if (
+            masked_m is not None
+            or use_v2_fp8_group_quant(group_size)
+        ):
             per_token_group_quant_fp8_v2(
                 x,
                 x_q,

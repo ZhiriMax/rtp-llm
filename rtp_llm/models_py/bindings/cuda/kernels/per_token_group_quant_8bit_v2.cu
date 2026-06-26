@@ -1,5 +1,6 @@
 // Adapt from https://github.com/sgl-project/sglang/blob/main/sgl-kernel/csrc/gemm/per_token_group_quant_8bit_v2.cu
 #include "per_token_group_quant_8bit_v2.h"
+#include "rtp_llm/models_py/bindings/cuda/launch_utils.h"
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/util/Float8_e4m3fn.h>
 
@@ -132,7 +133,6 @@ __device__ __forceinline__ int compute_input_group_start_offset(int expert_idx,
            + token_idx * hidden_size * (FUSE_SILU_AND_MUL ? 2 : 1) + hidden_dim_group_idx * group_size;
 }
 
-constexpr float    LOCAL_ABSMAX_ABS            = 1e-10;
 constexpr uint32_t INPUT_PRIMARY_VEC_NUM_BYTES = 32;
 
 struct NaiveScheduler {
@@ -254,10 +254,15 @@ __global__ void per_token_group_quant_8bit_kernel(const T* __restrict__ input,
                                                   // TODO can this be removed?
                                                   const int scale_expert_stride,
                                                   const int scale_hidden_stride,
-                                                  const int num_tokens_per_expert) {
+                                                  const int num_tokens_per_expert,
+                                                  const float eps) {
     using dst_dtype_info  = DtypeInfo<DST_DTYPE>;
     using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
     static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    cudaGridDependencySynchronize();
+#endif
 
     SCHEDULER::execute<FUSE_SILU_AND_MUL, GROUP_SIZE, THREADS_PER_SUBWARP>(
         subwarps_per_block,
@@ -326,7 +331,7 @@ __global__ void per_token_group_quant_8bit_kernel(const T* __restrict__ input,
                 }
             }
 
-            float local_absmax = LOCAL_ABSMAX_ABS;
+            float local_absmax = eps;
 
 #pragma unroll
             for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; ++j) {
@@ -389,6 +394,10 @@ __global__ void per_token_group_quant_8bit_kernel(const T* __restrict__ input,
                 reinterpret_cast<int4*>(output_q + offset_num_groups * GROUP_SIZE + lane_id * INPUT_PRIMARY_VEC_SIZE),
                 output_buf);
         });
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
 }
 
 void sgl_per_token_group_quant_8bit_v2(
@@ -408,8 +417,6 @@ void sgl_per_token_group_quant_8bit_v2(
     CHECK_INPUT(input);
     CHECK_INPUT(output_q);
     TORCH_CHECK(input.numel() > 0);
-
-    TORCH_CHECK(std::abs(LOCAL_ABSMAX_ABS - eps) < 1e-13);
 
     CHECK_EQ(input.numel() % group_size, 0);
     const int num_groups = static_cast<int>(input.numel()) / group_size / (fuse_silu_and_mul ? 2 : 1);
@@ -441,16 +448,22 @@ void sgl_per_token_group_quant_8bit_v2(
                                        grid,                                                                           \
                                        block);                                                                         \
                                                                                                                        \
-        per_token_group_quant_8bit_kernel<SCHEDULER, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, __VA_ARGS__>       \
-            <<<grid, block, 0, stream>>>(static_cast<T*>(input.data_ptr()),                                            \
-                                         static_cast<DST_DTYPE*>(output_q.data_ptr()),                                 \
-                                         static_cast<output_s_dtype*>(output_s.data_ptr()),                            \
-                                         static_cast<int32_t*>(masked_m.has_value() ? masked_m->data_ptr() : 0),       \
-                                         subwarps_per_block,                                                           \
-                                         hidden_dim_num_groups,                                                        \
-                                         scale_expert_stride,                                                          \
-                                         scale_hidden_stride,                                                          \
-                                         num_tokens_per_expert);                                                       \
+        LAUNCH_KERNEL_WITH_PDL(                                                                                        \
+            (per_token_group_quant_8bit_kernel<SCHEDULER, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, __VA_ARGS__>),\
+            grid,                                                                                                      \
+            block,                                                                                                     \
+            0,                                                                                                         \
+            stream,                                                                                                    \
+            static_cast<T*>(input.data_ptr()),                                                                         \
+            static_cast<DST_DTYPE*>(output_q.data_ptr()),                                                              \
+            static_cast<output_s_dtype*>(output_s.data_ptr()),                                                         \
+            static_cast<int32_t*>(masked_m.has_value() ? masked_m->data_ptr() : 0),                                    \
+            subwarps_per_block,                                                                                        \
+            hidden_dim_num_groups,                                                                                     \
+            scale_expert_stride,                                                                                       \
+            scale_hidden_stride,                                                                                       \
+            num_tokens_per_expert,                                                                                     \
+            (float)eps);                                                                                               \
     } while (0)
 
 #define LAUNCH_KERNEL(GROUP_SIZE, T, DST_DTYPE)                                                                        \

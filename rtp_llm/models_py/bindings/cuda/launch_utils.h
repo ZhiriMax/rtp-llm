@@ -1,5 +1,9 @@
 #pragma once
 
+#if USING_CUDA
+#include "rtp_llm/models_py/bindings/cuda/cuda_host_utils.h"
+#endif
+
 namespace rtp_llm {
 
 bool getEnvEnablePDL();
