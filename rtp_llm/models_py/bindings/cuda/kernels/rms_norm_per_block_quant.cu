@@ -26,7 +26,7 @@ __device__ __forceinline__ float blockReduceSum(float val, float* smem) {
     return smem[0];
 }
 
-template<typename T, int GROUP_SIZE, bool IS_COLUMN_MAJOR>
+template<typename T, int GROUP_SIZE>
 __global__ void rmsNormPerBlockQuantFp8Kernel(const T* __restrict__ input,
                                               __nv_fp8_e4m3* __restrict__ output_q,
                                               float* __restrict__ output_s,
@@ -106,11 +106,7 @@ __global__ void rmsNormPerBlockQuantFp8Kernel(const T* __restrict__ input,
         const int   group_idx = threadIdx.x / threads_per_group;
         const float absmax    = reduce_smem[threadIdx.x];
         group_scales[group_idx] = max_8bit / absmax;
-        if constexpr (IS_COLUMN_MAJOR) {
-            output_s[group_idx * scale_hidden_stride + token_idx] = absmax / max_8bit;
-        } else {
-            output_s[token_idx * scale_token_stride + group_idx] = absmax / max_8bit;
-        }
+        output_s[token_idx * scale_token_stride + group_idx * scale_hidden_stride] = absmax / max_8bit;
     }
     __syncthreads();
 
@@ -175,16 +171,8 @@ void rms_norm_per_block_quant_fp8(torch::Tensor input,
                 "output_s shape must be (tokens, hidden_size / group_size)");
     TORCH_CHECK(output_s.numel() >= tokens * hidden_groups, "output_s buffer is too small");
 
-    const bool is_column_major    = output_s.stride(0) < output_s.stride(1);
     const int  scale_token_stride = static_cast<int>(output_s.stride(0));
     const int  scale_group_stride = static_cast<int>(output_s.stride(1));
-    if (is_column_major) {
-        TORCH_CHECK(output_s.stride(0) == 1, "column-major output_s must have token stride 1");
-        TORCH_CHECK(output_s.stride(1) >= tokens, "column-major output_s hidden stride is too small");
-    } else {
-        TORCH_CHECK(output_s.stride(1) == 1, "row-major output_s must have hidden stride 1");
-        TORCH_CHECK(output_s.stride(0) >= hidden_groups, "row-major output_s token stride is too small");
-    }
     const int  block_size = hidden_groups > 512 ? 1024 : (hidden_groups > 256 ? 512 : 256);
     TORCH_CHECK(hidden_groups <= block_size, "hidden group count is too large for fused RMSNorm quant");
     const dim3 grid(tokens);
@@ -194,33 +182,18 @@ void rms_norm_per_block_quant_fp8(torch::Tensor input,
 
 #define LAUNCH_RMS_NORM_PER_BLOCK_QUANT(GROUP_SIZE, T)                                                                \
     do {                                                                                                               \
-        if (is_column_major) {                                                                                         \
-            rmsNormPerBlockQuantFp8Kernel<T, GROUP_SIZE, true><<<grid, block, shared_mem_size, stream>>>(              \
-                static_cast<T*>(input.data_ptr()),                                                                     \
-                reinterpret_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),                                                 \
-                static_cast<float*>(output_s.data_ptr()),                                                              \
-                static_cast<T*>(weight.data_ptr()),                                                                    \
-                hidden_size,                                                                                           \
-                hidden_groups,                                                                                         \
-                scale_token_stride,                                                                                    \
-                scale_group_stride,                                                                                    \
-                static_cast<float>(rms_eps),                                                                           \
-                static_cast<float>(quant_eps),                                                                         \
-                static_cast<float>(max_8bit));                                                                         \
-        } else {                                                                                                       \
-            rmsNormPerBlockQuantFp8Kernel<T, GROUP_SIZE, false><<<grid, block, shared_mem_size, stream>>>(             \
-                static_cast<T*>(input.data_ptr()),                                                                     \
-                reinterpret_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),                                                 \
-                static_cast<float*>(output_s.data_ptr()),                                                              \
-                static_cast<T*>(weight.data_ptr()),                                                                    \
-                hidden_size,                                                                                           \
-                hidden_groups,                                                                                         \
-                scale_token_stride,                                                                                    \
-                scale_group_stride,                                                                                    \
-                static_cast<float>(rms_eps),                                                                           \
-                static_cast<float>(quant_eps),                                                                         \
-                static_cast<float>(max_8bit));                                                                         \
-        }                                                                                                              \
+        rmsNormPerBlockQuantFp8Kernel<T, GROUP_SIZE><<<grid, block, shared_mem_size, stream>>>(                        \
+            static_cast<T*>(input.data_ptr()),                                                                         \
+            reinterpret_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),                                                     \
+            static_cast<float*>(output_s.data_ptr()),                                                                  \
+            static_cast<T*>(weight.data_ptr()),                                                                        \
+            hidden_size,                                                                                               \
+            hidden_groups,                                                                                             \
+            scale_token_stride,                                                                                        \
+            scale_group_stride,                                                                                        \
+            static_cast<float>(rms_eps),                                                                               \
+            static_cast<float>(quant_eps),                                                                             \
+            static_cast<float>(max_8bit));                                                                             \
     } while (0)
 
 #define LAUNCH_RMS_NORM_PER_BLOCK_QUANT_OUTER(T)                                                                       \
