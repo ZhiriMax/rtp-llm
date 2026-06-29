@@ -95,8 +95,8 @@ def _select_cases(case: str) -> Iterable[ProjectionShape]:
 def _make_blockwise_linear(k: int, n: int) -> CudaFp8VllmBlockwiseLinear:
     weight = torch.empty(k, n, device="cuda", dtype=torch.float8_e4m3fn)
     weight_scales = torch.rand(
-        (n + 127) // 128,
         (k + 127) // 128,
+        (n + 127) // 128,
         device="cuda",
         dtype=torch.float32,
     )
