@@ -23,6 +23,9 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/all.h>
 
+#include <cstdlib>
+#include <cstring>
+#include <limits>
 #include <type_traits>
 
 #include "cutlass_scaled_mm_blockwise_sm120_fp8.h"
@@ -67,6 +70,109 @@ void check_cuda_same_device(torch::Tensor const& tensor, char const* name, c10::
 
 void check_contiguous(torch::Tensor const& tensor, char const* name) {
     TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+}
+
+enum class Sm120Fp8Config {
+    Auto,
+    Default,
+    Pingpong,
+    SwapAb,
+};
+
+enum class Sm120Fp8Policy {
+    Auto,
+    NSensitive,
+    KSensitive,
+    NKSensitive,
+};
+
+bool env_equals(char const* value, char const* expected) {
+    return value != nullptr && std::strcmp(value, expected) == 0;
+}
+
+int get_env_int(char const* name, int default_value) {
+    char const* value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return default_value;
+    }
+    return std::atoi(value);
+}
+
+Sm120Fp8Config get_force_config() {
+    char const* value = std::getenv("FP8_BLOCKWISE_SM120_FORCE_CONFIG");
+    if (value == nullptr || value[0] == '\0' || env_equals(value, "auto")) {
+        return Sm120Fp8Config::Auto;
+    }
+    if (env_equals(value, "default")) {
+        return Sm120Fp8Config::Default;
+    }
+    if (env_equals(value, "pingpong")) {
+        return Sm120Fp8Config::Pingpong;
+    }
+    if (env_equals(value, "swap_ab") || env_equals(value, "swapab")) {
+        return Sm120Fp8Config::SwapAb;
+    }
+    TORCH_CHECK(false,
+                "Unsupported FP8_BLOCKWISE_SM120_FORCE_CONFIG=",
+                value,
+                ", expected auto/default/pingpong/swap_ab");
+    return Sm120Fp8Config::Auto;
+}
+
+Sm120Fp8Policy get_dispatch_policy() {
+    char const* value = std::getenv("FP8_BLOCKWISE_SM120_DISPATCH_POLICY");
+    if (value == nullptr || value[0] == '\0' || env_equals(value, "auto")) {
+        return Sm120Fp8Policy::Auto;
+    }
+    if (env_equals(value, "n_sensitive")) {
+        return Sm120Fp8Policy::NSensitive;
+    }
+    if (env_equals(value, "k_sensitive")) {
+        return Sm120Fp8Policy::KSensitive;
+    }
+    if (env_equals(value, "nk_sensitive")) {
+        return Sm120Fp8Policy::NKSensitive;
+    }
+    TORCH_CHECK(false,
+                "Unsupported FP8_BLOCKWISE_SM120_DISPATCH_POLICY=",
+                value,
+                ", expected auto/n_sensitive/k_sensitive/nk_sensitive");
+    return Sm120Fp8Policy::Auto;
+}
+
+Sm120Fp8Config select_auto_config(int M, int N, int K) {
+    if (M <= 64) {
+        return Sm120Fp8Config::SwapAb;
+    }
+    if (M <= 256) {
+        return Sm120Fp8Config::Pingpong;
+    }
+
+    Sm120Fp8Policy policy = get_dispatch_policy();
+    if (policy == Sm120Fp8Policy::Auto) {
+        return Sm120Fp8Config::Default;
+    }
+
+    int max_m       = get_env_int("FP8_BLOCKWISE_SM120_PINGPONG_MAX_M", 2048);
+    int max_n       = get_env_int("FP8_BLOCKWISE_SM120_PINGPONG_MAX_N", 1152);
+    int min_k_tiles = get_env_int("FP8_BLOCKWISE_SM120_PINGPONG_MIN_K_TILES", 16);
+    int max_k_tiles = get_env_int("FP8_BLOCKWISE_SM120_PINGPONG_MAX_K_TILES", std::numeric_limits<int>::max());
+    int k_tiles     = static_cast<int>(ceil_div(K, 128));
+
+    bool m_match = M <= max_m;
+    bool n_match = N <= max_n;
+    bool k_match = (k_tiles >= min_k_tiles) && (k_tiles <= max_k_tiles);
+
+    if (policy == Sm120Fp8Policy::NSensitive && m_match && n_match) {
+        return Sm120Fp8Config::Pingpong;
+    }
+    if (policy == Sm120Fp8Policy::KSensitive && m_match && k_match) {
+        return Sm120Fp8Config::Pingpong;
+    }
+    if (policy == Sm120Fp8Policy::NKSensitive && m_match && n_match && k_match) {
+        return Sm120Fp8Config::Pingpong;
+    }
+    return Sm120Fp8Config::Default;
 }
 
 // SM12x family CUDA_ARCH gate (verbatim from vllm cutlass_extensions/common.hpp)
@@ -332,7 +438,7 @@ void launch_one(torch::Tensor&       D,
     CUTLASS_CHECK(gemm_op.run(args, workspace.data_ptr(), stream));
 }
 
-// M-tier dispatch + M<=64 swap-AB heuristic.
+// M-tier dispatch + optional env-controlled experiments.
 template<typename OutType>
 void dispatch_blockwise_sm120(torch::Tensor&       D,
                               torch::Tensor const& A,
@@ -344,17 +450,19 @@ void dispatch_blockwise_sm120(torch::Tensor&       D,
                               int                  N,
                               int                  K,
                               cudaStream_t         stream) {
-    bool swap_ab = (M <= 64);
-    if (!swap_ab) {
-        if (M <= 256) {
-            launch_one<typename sm120_blockwise_fp8_config_pingpong<OutType>::Gemm>(
-                D, A, B, A_sf, B_sf, bias, M, N, K, stream);
-        } else {
-            launch_one<typename sm120_blockwise_fp8_config_default<OutType>::Gemm>(
-                D, A, B, A_sf, B_sf, bias, M, N, K, stream);
-        }
-    } else {
+    Sm120Fp8Config config = get_force_config();
+    if (config == Sm120Fp8Config::Auto) {
+        config = select_auto_config(M, N, K);
+    }
+
+    if (config == Sm120Fp8Config::SwapAb) {
         launch_one<typename sm120_blockwise_fp8_config_swapab<OutType>::Gemm>(
+            D, A, B, A_sf, B_sf, bias, M, N, K, stream);
+    } else if (config == Sm120Fp8Config::Pingpong) {
+        launch_one<typename sm120_blockwise_fp8_config_pingpong<OutType>::Gemm>(
+            D, A, B, A_sf, B_sf, bias, M, N, K, stream);
+    } else {
+        launch_one<typename sm120_blockwise_fp8_config_default<OutType>::Gemm>(
             D, A, B, A_sf, B_sf, bias, M, N, K, stream);
     }
 }

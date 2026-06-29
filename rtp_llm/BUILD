@@ -524,9 +524,12 @@ py_library(
             ":embedding",
             "//rtp_llm/tools/convert:convert",
         ],
-            }) + select({
-                "//conditions:default": [],
-            }),
+    }) + select({
+        "@//:using_cuda12": [
+            "//rtp_llm/tools/bench:fp8_blockwise_sm120_bench",
+        ],
+        "//conditions:default": [],
+    }),
     data = [
         "//rtp_llm/libs:libs"
     ]

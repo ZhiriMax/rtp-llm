@@ -54,6 +54,17 @@ def _get_positive_int_env(name: str, default: int) -> int:
         return default
 
 
+def _get_int_env(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        logging.warning("Invalid %s=%r, fallback to %d", name, value, default)
+        return default
+
+
 _FP8_GEMM_SHAPE_TELEMETRY_INTERVAL = _get_positive_int_env(
     "FP8_GEMM_SHAPE_TELEMETRY_INTERVAL", 1000
 )
@@ -105,11 +116,41 @@ def _m_bucket(m: int) -> str:
     return "4097+"
 
 
-def _selected_sm120_config(m: int) -> str:
+def _selected_sm120_config(m: int, k: int, n: int) -> str:
+    force_config = os.environ.get("FP8_BLOCKWISE_SM120_FORCE_CONFIG", "auto")
+    if force_config in ("default", "pingpong", "swap_ab", "swapab"):
+        return "swap_ab" if force_config == "swapab" else force_config
+    if force_config != "auto":
+        return f"invalid_force:{force_config}"
+
     if m <= 64:
         return "swap_ab"
     if m <= 256:
         return "pingpong"
+
+    policy = os.environ.get("FP8_BLOCKWISE_SM120_DISPATCH_POLICY", "auto")
+    if policy == "auto":
+        return "default"
+
+    max_m = _get_int_env("FP8_BLOCKWISE_SM120_PINGPONG_MAX_M", 2048)
+    max_n = _get_int_env("FP8_BLOCKWISE_SM120_PINGPONG_MAX_N", 1152)
+    min_k_tiles = _get_int_env("FP8_BLOCKWISE_SM120_PINGPONG_MIN_K_TILES", 16)
+    max_k_tiles = _get_int_env(
+        "FP8_BLOCKWISE_SM120_PINGPONG_MAX_K_TILES", 2**31 - 1
+    )
+    k_tiles = (k + 127) // 128
+    m_match = m <= max_m
+    n_match = n <= max_n
+    k_match = min_k_tiles <= k_tiles <= max_k_tiles
+
+    if policy == "n_sensitive" and m_match and n_match:
+        return "pingpong"
+    if policy == "k_sensitive" and m_match and k_match:
+        return "pingpong"
+    if policy == "nk_sensitive" and m_match and n_match and k_match:
+        return "pingpong"
+    if policy != "n_sensitive" and policy != "k_sensitive" and policy != "nk_sensitive":
+        return f"invalid_policy:{policy}"
     return "default"
 
 
@@ -118,7 +159,7 @@ def _record_fp8_gemm_shape(m: int, k: int, n: int) -> None:
         return
 
     global _FP8_GEMM_SHAPE_TOTAL
-    selected_config = _selected_sm120_config(m)
+    selected_config = _selected_sm120_config(m, k, n)
     key = (_m_bucket(m), k, n, selected_config)
     _FP8_GEMM_SHAPE_COUNTER[key] += 1
     _FP8_GEMM_SHAPE_TOTAL += 1
