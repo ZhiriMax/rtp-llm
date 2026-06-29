@@ -14,6 +14,7 @@ from typing import Optional, Protocol, Tuple, Union
 import torch
 
 from rtp_llm.models_py.kernels.cuda.fp8_kernel import (
+    can_use_rms_norm_per_block_quant_fp8_fast_path,
     rms_norm_per_block_quant_fp8,
     sgl_per_token_group_quant_fp8,
 )
@@ -290,24 +291,34 @@ class CudaFp8VllmBlockwiseLinear(LinearBase):
 
     def quantize_rmsnorm(
         self, rmsnorm: _RMSNormLike, hidden_states: torch.Tensor
-    ) -> QuantizedActivation:
+    ) -> Optional[QuantizedActivation]:
         if hidden_states.dtype != torch.bfloat16:
-            raise ValueError(
-                f"Input tensor dtype must be bfloat16, got {hidden_states.dtype}"
-            )
+            return None
         if hidden_states.dim() != 2:
-            raise ValueError(
-                f"Input tensor dimension must be 2, got {hidden_states.dim()}D tensor"
-            )
+            return None
         if hidden_states.shape[-1] != self.K:
-            raise ValueError(
-                f"Input tensor inner dimension expected to be {self.K}, got "
-                f"{hidden_states.shape[-1]}"
-            )
+            return None
+        if not can_use_rms_norm_per_block_quant_fp8_fast_path(
+            hidden_states,
+            group_size=_SM120_FP8_INPUT_GROUP_SIZE,
+            scale_ue8m0=_SM120_FP8_INPUT_SCALE_LAYOUT.scale_ue8m0,
+        ):
+            return None
+        rms_weight = getattr(rmsnorm, "weight", None)
+        rms_eps = getattr(rmsnorm, "variance_epsilon", None)
+        if rms_weight is None or rms_eps is None:
+            return None
+        rms_weight = rms_weight.data
+        if (
+            rms_weight.shape != (self.K,)
+            or rms_weight.device != hidden_states.device
+            or rms_weight.dtype != hidden_states.dtype
+        ):
+            return None
         input_fp8, input_scales = rms_norm_per_block_quant_fp8(
             hidden_states,
-            rmsnorm.weight.data,
-            rmsnorm.variance_epsilon,
+            rms_weight,
+            rms_eps,
             group_size=_SM120_FP8_INPUT_GROUP_SIZE,
             quant_eps=_SM120_FP8_INPUT_EPS,
             column_major_scales=_SM120_FP8_INPUT_SCALE_LAYOUT.column_major_scales,
@@ -355,10 +366,10 @@ class CudaFp8VllmBlockwiseLinear(LinearBase):
                 f"{tuple(input_scales.shape)}"
             )
         if _SM120_FP8_INPUT_SCALE_LAYOUT.column_major_scales:
-            if input_scales.stride(-2) != 1 or input_scales.stride(-1) < M:
+            if input_scales.stride(-2) != 1 or input_scales.stride(-1) != M:
                 raise ValueError(
                     "Column-major input scales must have token stride 1 and "
-                    "K-group stride at least M"
+                    "K-group stride equal to M"
                 )
         elif (
             input_scales.stride(-1) != 1

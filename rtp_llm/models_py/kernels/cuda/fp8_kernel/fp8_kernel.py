@@ -36,6 +36,7 @@ fp8_min = -fp8_max
 
 _FP8_GROUP_QUANT_KERNEL_ENV = "FP8_GROUP_QUANT_KERNEL"
 _FP8_GROUP_QUANT_V2_SUPPORTED_GROUP_SIZES = (16, 32, 64, 128)
+_RMS_NORM_PER_BLOCK_QUANT_FAST_GROUP_SIZES = (16, 32, 64, 128)
 _FP8_GROUP_QUANT_KERNEL = os.environ.get(_FP8_GROUP_QUANT_KERNEL_ENV, "v1")
 
 
@@ -189,8 +190,11 @@ def rms_norm_per_block_quant_fp8(
 ):
     assert not scale_ue8m0, "rms_norm_per_block_quant_fp8 does not support UE8M0 scales"
     assert x.dim() == 2, "rms_norm_per_block_quant_fp8 expects a 2D input"
-    assert x.shape[-1] % group_size == 0, "input hidden size must be divisible by group_size"
     assert x.is_contiguous(), "`x` is not contiguous"
+    assert rms_eps > 0.0, "rms_eps must be positive"
+    assert quant_eps > 0.0, "quant_eps must be positive"
+    assert group_size > 0 and group_size % 4 == 0, "group_size must be positive and divisible by 4"
+    assert x.shape[-1] % group_size == 0, "input hidden size must be divisible by group_size"
 
     x_q = torch.empty_like(x, dtype=fp8_dtype)
     x_s = create_per_token_group_quant_fp8_output_scale(
@@ -214,6 +218,25 @@ def rms_norm_per_block_quant_fp8(
             fp8_max,
         )
     return x_q, x_s
+
+
+def can_use_rms_norm_per_block_quant_fp8_fast_path(
+    x: torch.Tensor,
+    group_size: int,
+    scale_ue8m0: bool = False,
+) -> bool:
+    # Production fusion only takes the vectorized 32B-lane path; other shapes
+    # remain available through the eager op but should not be silently put on
+    # the latency-critical path without profiling.
+    if scale_ue8m0 or x.dim() != 2 or not x.is_contiguous():
+        return False
+    if group_size not in _RMS_NORM_PER_BLOCK_QUANT_FAST_GROUP_SIZES:
+        return False
+    hidden_size = x.shape[-1]
+    if hidden_size % 4 != 0 or hidden_size % group_size != 0:
+        return False
+    hidden_groups = hidden_size // group_size
+    return hidden_groups * (group_size // 16) <= 1024
 
 
 def scaled_fp8_per_tensor_quant(

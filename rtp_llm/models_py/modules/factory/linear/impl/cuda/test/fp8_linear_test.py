@@ -9,7 +9,9 @@ import torch
 from rtp_llm.config.quant_config import init_quant_config
 from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import is_deep_gemm_e8m0_used
 from rtp_llm.models_py.kernels.cuda.fp8_kernel import (
+    can_use_rms_norm_per_block_quant_fp8_fast_path,
     requant_weight_ue8m0,
+    rms_norm_per_block_quant_fp8,
     sgl_per_token_group_quant_fp8,
 )
 from rtp_llm.models_py.modules.base import FusedSiluAndMul, RMSNorm
@@ -1055,6 +1057,166 @@ class CudaFp8GEMMDispatchTest(CudaFp8LinearTestBase, unittest.TestCase):
             self.assertIsNone(linear._flashinfer_linear)
 
 
+class CudaRmsNormPerBlockQuantFp8Test(unittest.TestCase):
+
+    def setUp(self):
+        if not torch.cuda.is_available():
+            self.skipTest("RMSNorm FP8 quant tests require CUDA")
+        torch.manual_seed(42)
+        torch.cuda.manual_seed(42)
+        self.device = "cuda"
+        self.M = 8
+
+    def test_rmsnorm_quant_matches_composed_path_for_group_sizes(self):
+        test_cases = [
+            (self.M, 128, (16, 32, 64, 128), (torch.bfloat16, torch.float16)),
+            (self.M, 384, (96, 192), (torch.bfloat16, torch.float16)),
+            (self.M, 512, (256, 512), (torch.bfloat16, torch.float16)),
+            (3, 896, (16, 32, 64, 128), (torch.bfloat16, torch.float16)),
+            (2, 12288, (16, 128), (torch.bfloat16,)),
+        ]
+        scale_layouts = ((False, False), (True, False), (True, True))
+        for quant_kernel in ("v1", "v2"):
+            with mock.patch(
+                "rtp_llm.models_py.kernels.cuda.fp8_kernel.fp8_kernel."
+                "_FP8_GROUP_QUANT_KERNEL",
+                quant_kernel,
+            ):
+                self.assertEqual(
+                    sgl_per_token_group_quant_fp8.__globals__[
+                        "_FP8_GROUP_QUANT_KERNEL"
+                    ],
+                    quant_kernel,
+                )
+                for M, K, group_sizes, dtypes in test_cases:
+                    for dtype in dtypes:
+                        input_tensor = torch.randn(
+                            M, K, dtype=dtype, device=self.device
+                        ).contiguous()
+                        rms_weight = torch.randn(K, dtype=dtype, device=self.device)
+                        rmsnorm = RMSNorm(rms_weight, eps=1e-6)
+                        normed = rmsnorm(input_tensor).contiguous()
+
+                        for group_size in group_sizes:
+                            for (
+                                column_major_scales,
+                                scale_tma_aligned,
+                            ) in scale_layouts:
+                                with self.subTest(
+                                    quant_kernel=quant_kernel,
+                                    M=M,
+                                    K=K,
+                                    dtype=dtype,
+                                    group_size=group_size,
+                                    column_major_scales=column_major_scales,
+                                    scale_tma_aligned=scale_tma_aligned,
+                                ):
+                                    fused_data, fused_scale = (
+                                        rms_norm_per_block_quant_fp8(
+                                            input_tensor,
+                                            rms_weight,
+                                            rms_eps=1e-6,
+                                            group_size=group_size,
+                                            quant_eps=1e-4,
+                                            column_major_scales=column_major_scales,
+                                            scale_tma_aligned=scale_tma_aligned,
+                                            scale_ue8m0=False,
+                                        )
+                                    )
+                                    ref_data, ref_scale = (
+                                        sgl_per_token_group_quant_fp8(
+                                            normed,
+                                            group_size=group_size,
+                                            eps=1e-4,
+                                            column_major_scales=column_major_scales,
+                                            scale_tma_aligned=scale_tma_aligned,
+                                            scale_ue8m0=False,
+                                        )
+                                    )
+
+                                    self.assertEqual(fused_data.shape, ref_data.shape)
+                                    self.assertEqual(
+                                        fused_scale.shape, ref_scale.shape
+                                    )
+                                    self.assertEqual(
+                                        fused_scale.stride(), ref_scale.stride()
+                                    )
+                                    torch.testing.assert_close(
+                                        fused_scale, ref_scale, rtol=1e-2, atol=1e-5
+                                    )
+                                    fused_deq = (
+                                        fused_data.float()
+                                        * fused_scale.repeat_interleave(
+                                            group_size, dim=-1
+                                        )
+                                    )
+                                    ref_deq = (
+                                        ref_data.float()
+                                        * ref_scale.repeat_interleave(
+                                            group_size, dim=-1
+                                        )
+                                    )
+                                    self.assertLess(
+                                        calc_diff(fused_deq, ref_deq), 0.003
+                                    )
+
+    def test_rmsnorm_quant_production_gate_keeps_vec_fast_path(self):
+        fast_input = torch.empty(
+            2, 12288, dtype=torch.bfloat16, device=self.device
+        ).contiguous()
+        generic_input = torch.empty(
+            1, 32768, dtype=torch.bfloat16, device=self.device
+        ).contiguous()
+
+        self.assertTrue(can_use_rms_norm_per_block_quant_fp8_fast_path(fast_input, 128))
+        self.assertFalse(can_use_rms_norm_per_block_quant_fp8_fast_path(generic_input, 128))
+        rms_weight = torch.randn(32768, dtype=torch.bfloat16, device=self.device)
+        generic_data, generic_scale = rms_norm_per_block_quant_fp8(
+            generic_input,
+            rms_weight,
+            rms_eps=1e-6,
+            group_size=128,
+            quant_eps=1e-4,
+        )
+        self.assertEqual(generic_data.shape, generic_input.shape)
+        self.assertEqual(generic_scale.shape, (1, 256))
+        with self.assertRaises(AssertionError):
+            rms_norm_per_block_quant_fp8(
+                fast_input,
+                torch.empty(12288, dtype=torch.bfloat16, device=self.device),
+                rms_eps=1e-6,
+                group_size=0,
+                quant_eps=1e-4,
+            )
+        with self.assertRaises(AssertionError):
+            rms_norm_per_block_quant_fp8(
+                fast_input,
+                torch.empty(12288, dtype=torch.bfloat16, device=self.device),
+                rms_eps=0.0,
+                group_size=128,
+                quant_eps=1e-4,
+            )
+        with self.assertRaises(AssertionError):
+            rms_norm_per_block_quant_fp8(
+                fast_input,
+                torch.empty(12288, dtype=torch.bfloat16, device=self.device),
+                rms_eps=1e-6,
+                group_size=128,
+                quant_eps=0.0,
+            )
+        non_divisible_input = torch.empty(
+            2, 130, dtype=torch.bfloat16, device=self.device
+        ).contiguous()
+        with self.assertRaises(AssertionError):
+            rms_norm_per_block_quant_fp8(
+                non_divisible_input,
+                torch.empty(130, dtype=torch.bfloat16, device=self.device),
+                rms_eps=1e-6,
+                group_size=128,
+                quant_eps=1e-4,
+            )
+
+
 @unittest.skipIf(
     cutlass_scaled_mm_blockwise_sm120_fp8 is None,
     "SM120 FP8 blockwise op is only available on sm12x CUDA builds",
@@ -1219,6 +1381,41 @@ class CudaFp8VllmBlockwiseSM120BoundaryTest(unittest.TestCase):
         ref_output = linear(normed)
         self.assertEqual(output.shape, (self.M, self.N))
         self.assertLess(calc_diff(output, ref_output), 0.003)
+
+    def test_rmsnorm_quant_fusion_falls_back_when_not_applicable(self):
+        weight = torch.randn(
+            self.K, self.N, dtype=torch.float32, device=self.device
+        ).to(torch.float8_e4m3fn)
+        weight_scales = torch.rand(
+            (self.K + 127) // 128,
+            (self.N + 127) // 128,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        linear = CudaFp8VllmBlockwiseLinear(weight, weight_scales)
+        rms_weight = torch.randn(self.K, dtype=torch.bfloat16, device=self.device)
+        rmsnorm = RMSNorm(rms_weight, eps=1e-6)
+        non_contiguous_input = torch.randn(
+            self.K, self.M, dtype=torch.bfloat16, device=self.device
+        ).t()
+
+        self.assertFalse(non_contiguous_input.is_contiguous())
+        self.assertIsNone(linear.quantize_rmsnorm(rmsnorm, non_contiguous_input))
+
+        fp32_rmsnorm = RMSNorm(rms_weight.float(), eps=1e-6)
+        contiguous_input = non_contiguous_input.contiguous()
+        self.assertIsNone(linear.quantize_rmsnorm(fp32_rmsnorm, contiguous_input))
+
+        fp16_input = contiguous_input.to(torch.float16)
+        self.assertIsNone(linear.quantize_rmsnorm(rmsnorm, fp16_input))
+        input_3d = contiguous_input.reshape(1, self.M, self.K)
+        self.assertIsNone(linear.quantize_rmsnorm(rmsnorm, input_3d))
+
+        class ForwardOnlyNorm(torch.nn.Module):
+            def forward(self, hidden_states):
+                return hidden_states
+
+        self.assertIsNone(linear.quantize_rmsnorm(ForwardOnlyNorm(), contiguous_input))
 
 
 CudaFp8DeepGEMMLinearTestBase = CudaFp8GEMMLinearTestBase
