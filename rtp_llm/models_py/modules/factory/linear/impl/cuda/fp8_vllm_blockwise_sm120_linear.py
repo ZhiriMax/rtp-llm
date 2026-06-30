@@ -113,14 +113,10 @@ def _selected_sm120_config(m: int, k: int, n: int) -> str:
     force_config = os.environ.get("FP8_BLOCKWISE_SM120_FORCE_CONFIG", "auto")
     if force_config in (
         "default",
-        "default64",
-        "default_64",
         "pingpong",
         "swap_ab",
         "swapab",
     ):
-        if force_config == "default_64":
-            return "default64"
         return "swap_ab" if force_config == "swapab" else force_config
     if force_config == "legacy":
         return _legacy_sm120_config(m, k, n)

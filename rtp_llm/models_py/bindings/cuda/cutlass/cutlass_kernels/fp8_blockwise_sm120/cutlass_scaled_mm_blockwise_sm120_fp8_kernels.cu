@@ -75,7 +75,6 @@ enum class Sm120Fp8Config {
     Auto,
     Legacy,
     Default,
-    Default64,
     Pingpong,
     SwapAb,
 };
@@ -95,9 +94,6 @@ Sm120Fp8Config get_force_config() {
     if (env_equals(value, "legacy")) {
         return Sm120Fp8Config::Legacy;
     }
-    if (env_equals(value, "default64") || env_equals(value, "default_64")) {
-        return Sm120Fp8Config::Default64;
-    }
     if (env_equals(value, "pingpong")) {
         return Sm120Fp8Config::Pingpong;
     }
@@ -107,7 +103,7 @@ Sm120Fp8Config get_force_config() {
     TORCH_CHECK(false,
                 "Unsupported FP8_BLOCKWISE_SM120_FORCE_CONFIG=",
                 value,
-                ", expected auto/legacy/default/default64/pingpong/swap_ab");
+                ", expected auto/legacy/default/pingpong/swap_ab");
     return Sm120Fp8Config::Auto;
 }
 
@@ -290,16 +286,6 @@ struct sm120_blockwise_fp8_config_default {
 };
 
 template<typename OutType>
-struct sm120_blockwise_fp8_config_default64 {
-    using KernelSchedule   = cutlass::gemm::collective::KernelScheduleAuto;
-    using EpilogueSchedule = cutlass::epilogue::collective::EpilogueScheduleAuto;
-    using TileShape        = Shape<_64, _128, _128>;
-    using ClusterShape     = Shape<_1, _1, _1>;
-    using Gemm =
-        cutlass_3x_gemm_fp8_blockwise<OutType, 1, 128, 128, TileShape, ClusterShape, EpilogueSchedule, KernelSchedule>;
-};
-
-template<typename OutType>
 struct sm120_blockwise_fp8_config_pingpong {
     using KernelSchedule   = cutlass::gemm::KernelTmaWarpSpecializedBlockwisePingpongSm120;
     using EpilogueSchedule = cutlass::epilogue::collective::EpilogueScheduleAuto;
@@ -433,9 +419,6 @@ void dispatch_blockwise_sm120(torch::Tensor&       D,
             D, A, B, A_sf, B_sf, bias, M, N, K, stream);
     } else if (config == Sm120Fp8Config::Pingpong) {
         launch_one<typename sm120_blockwise_fp8_config_pingpong<OutType>::Gemm>(
-            D, A, B, A_sf, B_sf, bias, M, N, K, stream);
-    } else if (config == Sm120Fp8Config::Default64) {
-        launch_one<typename sm120_blockwise_fp8_config_default64<OutType>::Gemm>(
             D, A, B, A_sf, B_sf, bias, M, N, K, stream);
     } else {
         launch_one<typename sm120_blockwise_fp8_config_default<OutType>::Gemm>(
