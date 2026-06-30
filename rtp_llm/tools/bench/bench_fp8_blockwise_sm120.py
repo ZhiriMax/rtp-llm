@@ -4,6 +4,12 @@ Examples:
   python3 -m rtp_llm.tools.bench.bench_fp8_blockwise_sm120 bare-gemm \
       --case all --m-list 768,1024,1536,2048
 
+  python3 -m rtp_llm.tools.bench.bench_fp8_blockwise_sm120 compare-bare \
+      --case all --m-list 768,1024,1536,2048 --configs legacy,auto
+
+  python3 -m rtp_llm.tools.bench.bench_fp8_blockwise_sm120 compare-bare \
+      --custom-shapes 1024x896x1152,1024x4864x896 --configs legacy,auto
+
   python3 -m rtp_llm.tools.bench.bench_fp8_blockwise_sm120 rms-stress \
       --case qkv --m 1024 --duration 30 --mode both
 
@@ -13,6 +19,7 @@ Examples:
 
 import argparse
 import os
+import statistics
 import time
 from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
@@ -39,6 +46,14 @@ class ProjectionShape:
     n: int
 
 
+@dataclass(frozen=True)
+class GemmBenchCase:
+    name: str
+    m: int
+    k: int
+    n: int
+
+
 PROJECTION_SHAPES: Dict[str, ProjectionShape] = {
     "qkv": ProjectionShape("qkv", QWEN2_05B_HIDDEN, QWEN2_05B_QKV),
     "o_proj": ProjectionShape("o_proj", QWEN2_05B_HIDDEN, QWEN2_05B_HIDDEN),
@@ -60,14 +75,7 @@ def _print_header(title: str) -> None:
     _require_cuda()
     print(torch.cuda.get_device_name())
     print(title)
-    env_keys = [
-        "FP8_BLOCKWISE_SM120_FORCE_CONFIG",
-        "FP8_BLOCKWISE_SM120_DISPATCH_POLICY",
-        "FP8_BLOCKWISE_SM120_PINGPONG_MAX_M",
-        "FP8_BLOCKWISE_SM120_PINGPONG_MAX_N",
-        "FP8_BLOCKWISE_SM120_PINGPONG_MIN_K_TILES",
-        "FP8_BLOCKWISE_SM120_PINGPONG_MAX_K_TILES",
-    ]
+    env_keys = ["FP8_BLOCKWISE_SM120_FORCE_CONFIG"]
     active_env = {key: os.environ.get(key) for key in env_keys if os.environ.get(key)}
     if active_env:
         print("dispatch env: " + ", ".join(f"{k}={v}" for k, v in active_env.items()))
@@ -84,12 +92,44 @@ def _parse_m_list(raw: str) -> List[int]:
     return values
 
 
+def _parse_custom_shapes(raw: Optional[str]) -> List[GemmBenchCase]:
+    if not raw:
+        return []
+    cases = []
+    for idx, item in enumerate(raw.split(",")):
+        item = item.strip().lower()
+        if not item:
+            continue
+        dims = item.replace("*", "x").split("x")
+        if len(dims) != 3:
+            raise ValueError(
+                f"invalid custom shape {item!r}, expected MxKxN, e.g. 1024x896x1152"
+            )
+        m, k, n = (int(dim) for dim in dims)
+        cases.append(GemmBenchCase(f"custom{idx}", m, k, n))
+    return cases
+
+
 def _select_cases(case: str) -> Iterable[ProjectionShape]:
     if case == "all":
         return PROJECTION_SHAPES.values()
     if case not in PROJECTION_SHAPES:
         raise ValueError(f"unknown case={case}, expected one of all/{list(PROJECTION_SHAPES)}")
     return [PROJECTION_SHAPES[case]]
+
+
+def _iter_bare_cases(
+    case: str, m_list: str, custom_shapes: Optional[str]
+) -> Iterable[GemmBenchCase]:
+    custom = _parse_custom_shapes(custom_shapes)
+    if custom:
+        return custom
+    m_values = _parse_m_list(m_list)
+    return [
+        GemmBenchCase(shape.name, m, shape.k, shape.n)
+        for shape in _select_cases(case)
+        for m in m_values
+    ]
 
 
 def _make_blockwise_linear(k: int, n: int) -> CudaFp8VllmBlockwiseLinear:
@@ -107,6 +147,27 @@ def _make_blockwise_linear(k: int, n: int) -> CudaFp8VllmBlockwiseLinear:
         bias=None,
         quant_config=None,
     )
+
+
+def _make_bare_gemm_case(case: GemmBenchCase) -> Tuple[Callable[[], torch.Tensor], int]:
+    linear = _make_blockwise_linear(case.k, case.n)
+    x = torch.randn(case.m, case.k, device="cuda", dtype=torch.bfloat16)
+    input_fp8, input_scales = linear._quantize_input(x)
+    out = torch.empty(case.m, case.n, device="cuda", dtype=torch.bfloat16)
+
+    def run() -> torch.Tensor:
+        cutlass_scaled_mm_blockwise_sm120_fp8(
+            out,
+            input_fp8,
+            linear.weight,
+            input_scales,
+            linear.weight_scales,
+            None,
+        )
+        return out
+
+    flops = 2 * case.m * case.k * case.n
+    return run, flops
 
 
 def _measure_ms(
@@ -178,32 +239,90 @@ def _run_stress(
 
 def bare_gemm(args: argparse.Namespace) -> None:
     _print_header("Running bare cutlass_scaled_mm_blockwise_sm120_fp8 microbench...")
-    m_values = _parse_m_list(args.m_list)
-    for shape in _select_cases(args.case):
-        linear = _make_blockwise_linear(shape.k, shape.n)
-        for m in m_values:
-            x = torch.randn(m, shape.k, device="cuda", dtype=torch.bfloat16)
-            input_fp8, input_scales = linear._quantize_input(x)
-            out = torch.empty(m, shape.n, device="cuda", dtype=torch.bfloat16)
+    for bench_case in _iter_bare_cases(args.case, args.m_list, args.custom_shapes):
+        run, flops = _make_bare_gemm_case(bench_case)
+        mean, p50, min_ms = _measure_ms(run, args.warmup, args.iters)
+        tflops = flops / (mean / 1000.0) / 1e12
+        print(
+            f"{bench_case.name:<8} M={bench_case.m:5d} K={bench_case.k:5d} N={bench_case.n:5d} "
+            f"mean={mean:8.4f} ms p50={p50:8.4f} ms min={min_ms:8.4f} ms "
+            f"{tflops:8.2f} TFLOPS"
+        )
 
-            def run() -> torch.Tensor:
-                cutlass_scaled_mm_blockwise_sm120_fp8(
-                    out,
-                    input_fp8,
-                    linear.weight,
-                    input_scales,
-                    linear.weight_scales,
-                    None,
+
+def _set_force_config(config: str) -> Optional[str]:
+    old_value = os.environ.get("FP8_BLOCKWISE_SM120_FORCE_CONFIG")
+    os.environ["FP8_BLOCKWISE_SM120_FORCE_CONFIG"] = config
+    return old_value
+
+
+def _restore_force_config(old_value: Optional[str]) -> None:
+    if old_value is None:
+        os.environ.pop("FP8_BLOCKWISE_SM120_FORCE_CONFIG", None)
+    else:
+        os.environ["FP8_BLOCKWISE_SM120_FORCE_CONFIG"] = old_value
+
+
+def compare_bare(args: argparse.Namespace) -> None:
+    _print_header("Comparing bare cutlass_scaled_mm_blockwise_sm120_fp8 configs...")
+    configs = [config.strip() for config in args.configs.split(",") if config.strip()]
+    bench_cases = list(_iter_bare_cases(args.case, args.m_list, args.custom_shapes))
+    results: Dict[Tuple[str, str, int, int, int], float] = {}
+
+    print(
+        "config,shape,M,K,N,repeat,warmup,iters,mean_ms,median_ms,min_ms,max_ms,cv_pct,tflops"
+    )
+    old_config = os.environ.get("FP8_BLOCKWISE_SM120_FORCE_CONFIG")
+    try:
+        for config in configs:
+            _set_force_config(config)
+            for bench_case in bench_cases:
+                run, flops = _make_bare_gemm_case(bench_case)
+                means = [
+                    _measure_ms(run, args.warmup, args.iters)[0]
+                    for _ in range(args.repeat)
+                ]
+                mean_ms = statistics.mean(means)
+                median_ms = statistics.median(means)
+                min_ms = min(means)
+                max_ms = max(means)
+                stdev = statistics.stdev(means) if len(means) > 1 else 0.0
+                cv_pct = stdev / mean_ms * 100.0 if mean_ms > 0 else 0.0
+                tflops = flops / (mean_ms / 1000.0) / 1e12
+                key = (config, bench_case.name, bench_case.m, bench_case.k, bench_case.n)
+                results[key] = mean_ms
+                print(
+                    f"{config},{bench_case.name},{bench_case.m},{bench_case.k},{bench_case.n},"
+                    f"{args.repeat},{args.warmup},{args.iters},"
+                    f"{mean_ms:.6f},{median_ms:.6f},{min_ms:.6f},"
+                    f"{max_ms:.6f},{cv_pct:.3f},{tflops:.2f}"
                 )
-                return out
+    finally:
+        _restore_force_config(old_config)
 
-            mean, p50, min_ms = _measure_ms(run, args.warmup, args.iters)
-            tflops = (2.0 * m * shape.k * shape.n) / (mean / 1000.0) / 1e12
-            print(
-                f"{shape.name:<8} M={m:5d} K={shape.k:5d} N={shape.n:5d} "
-                f"mean={mean:8.4f} ms p50={p50:8.4f} ms min={min_ms:8.4f} ms "
-                f"{tflops:8.2f} TFLOPS"
+    if len(configs) < 2:
+        return
+
+    baseline = configs[0]
+    print("\nspeedup_vs_" + baseline)
+    print("shape,M,K,N," + ",".join(configs[1:]))
+    for bench_case in bench_cases:
+        baseline_ms = results.get(
+            (baseline, bench_case.name, bench_case.m, bench_case.k, bench_case.n)
+        )
+        speedups = []
+        for config in configs[1:]:
+            current_ms = results.get(
+                (config, bench_case.name, bench_case.m, bench_case.k, bench_case.n)
             )
+            if baseline_ms is None or current_ms is None:
+                speedups.append("nan")
+            else:
+                speedups.append(f"{baseline_ms / current_ms:.4f}")
+        print(
+            f"{bench_case.name},{bench_case.m},{bench_case.k},{bench_case.n},"
+            + ",".join(speedups)
+        )
 
 
 def _make_rms_case(shape: ProjectionShape, m: int) -> Tuple[
@@ -304,9 +423,26 @@ def build_parser() -> argparse.ArgumentParser:
     bare = subparsers.add_parser("bare-gemm")
     bare.add_argument("--case", default="all", choices=["all", *PROJECTION_SHAPES])
     bare.add_argument("--m-list", default="768,1024,1536,2048")
+    bare.add_argument(
+        "--custom-shapes",
+        help="Comma-separated MxKxN shapes. If set, --case/--m-list are ignored.",
+    )
     bare.add_argument("--warmup", type=int, default=50)
     bare.add_argument("--iters", type=int, default=200)
     bare.set_defaults(func=bare_gemm)
+
+    compare = subparsers.add_parser("compare-bare")
+    compare.add_argument("--case", default="all", choices=["all", *PROJECTION_SHAPES])
+    compare.add_argument("--m-list", default="768,1024,1536,2048")
+    compare.add_argument(
+        "--custom-shapes",
+        help="Comma-separated MxKxN shapes. If set, --case/--m-list are ignored.",
+    )
+    compare.add_argument("--configs", default="legacy,auto")
+    compare.add_argument("--repeat", type=int, default=10)
+    compare.add_argument("--warmup", type=int, default=300)
+    compare.add_argument("--iters", type=int, default=2000)
+    compare.set_defaults(func=compare_bare)
 
     rms = subparsers.add_parser("rms-stress")
     rms.add_argument("--case", default="qkv", choices=["qkv", "o_proj", "gate_up"])

@@ -54,15 +54,8 @@ def _get_positive_int_env(name: str, default: int) -> int:
         return default
 
 
-def _get_int_env(name: str, default: int) -> int:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        logging.warning("Invalid %s=%r, fallback to %d", name, value, default)
-        return default
+def _ceil_div(x: int, y: int) -> int:
+    return (x + y - 1) // y
 
 
 _FP8_GEMM_SHAPE_TELEMETRY_INTERVAL = _get_positive_int_env(
@@ -118,40 +111,45 @@ def _m_bucket(m: int) -> str:
 
 def _selected_sm120_config(m: int, k: int, n: int) -> str:
     force_config = os.environ.get("FP8_BLOCKWISE_SM120_FORCE_CONFIG", "auto")
-    if force_config in ("default", "pingpong", "swap_ab", "swapab"):
+    if force_config in (
+        "default",
+        "default64",
+        "default_64",
+        "pingpong",
+        "swap_ab",
+        "swapab",
+    ):
+        if force_config == "default_64":
+            return "default64"
         return "swap_ab" if force_config == "swapab" else force_config
+    if force_config == "legacy":
+        return _legacy_sm120_config(m, k, n)
     if force_config != "auto":
         return f"invalid_force:{force_config}"
 
+    return _auto_sm120_config(m, k, n)
+
+
+def _legacy_sm120_config(m: int, k: int, n: int) -> str:
     if m <= 64:
         return "swap_ab"
     if m <= 256:
         return "pingpong"
-
-    policy = os.environ.get("FP8_BLOCKWISE_SM120_DISPATCH_POLICY", "auto")
-    if policy == "auto":
-        return "default"
-
-    max_m = _get_int_env("FP8_BLOCKWISE_SM120_PINGPONG_MAX_M", 2048)
-    max_n = _get_int_env("FP8_BLOCKWISE_SM120_PINGPONG_MAX_N", 1152)
-    min_k_tiles = _get_int_env("FP8_BLOCKWISE_SM120_PINGPONG_MIN_K_TILES", 16)
-    max_k_tiles = _get_int_env(
-        "FP8_BLOCKWISE_SM120_PINGPONG_MAX_K_TILES", 2**31 - 1
-    )
-    k_tiles = (k + 127) // 128
-    m_match = m <= max_m
-    n_match = n <= max_n
-    k_match = min_k_tiles <= k_tiles <= max_k_tiles
-
-    if policy == "n_sensitive" and m_match and n_match:
-        return "pingpong"
-    if policy == "k_sensitive" and m_match and k_match:
-        return "pingpong"
-    if policy == "nk_sensitive" and m_match and n_match and k_match:
-        return "pingpong"
-    if policy != "n_sensitive" and policy != "k_sensitive" and policy != "nk_sensitive":
-        return f"invalid_policy:{policy}"
     return "default"
+
+
+def _auto_sm120_config(m: int, k: int, n: int) -> str:
+    sm = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    n_tiles = _ceil_div(n, 128)
+    d_cta = _ceil_div(m, 128) * n_tiles
+    p_cta = _ceil_div(m, 64) * n_tiles
+    d_waves = _ceil_div(d_cta, sm)
+    p_waves = _ceil_div(p_cta, sm)
+    single = p_cta <= sm
+    short_k = _ceil_div(k, 128) <= 4
+    pack_gt = p_cta * d_waves > d_cta * p_waves
+    underfill = 4 * d_cta <= 3 * d_waves * sm
+    return "pingpong" if single or (pack_gt and (short_k or underfill)) else "default"
 
 
 def _record_fp8_gemm_shape(m: int, k: int, n: int) -> None:
