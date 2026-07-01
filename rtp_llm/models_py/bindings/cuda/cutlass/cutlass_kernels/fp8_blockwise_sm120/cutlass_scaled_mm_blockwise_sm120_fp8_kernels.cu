@@ -107,6 +107,38 @@ Sm120Fp8Config get_force_config() {
     return Sm120Fp8Config::Auto;
 }
 
+int get_scheduler_swizzle_size() {
+    char const* value = std::getenv("FP8_BLOCKWISE_SM120_SWIZZLE");
+    if (value == nullptr || value[0] == '\0') {
+        return 0;
+    }
+    int size = std::atoi(value);
+    if (size <= 0) {
+        return 0;
+    }
+    return size > 8 ? 8 : size;
+}
+
+cutlass::gemm::kernel::detail::RasterOrderOptions get_scheduler_raster_order() {
+    using RasterOrderOptions = cutlass::gemm::kernel::detail::RasterOrderOptions;
+
+    char const* value = std::getenv("FP8_BLOCKWISE_SM120_RASTER");
+    if (value == nullptr || value[0] == '\0' || env_equals(value, "heuristic")) {
+        return RasterOrderOptions::Heuristic;
+    }
+    if (env_equals(value, "m") || env_equals(value, "along_m")) {
+        return RasterOrderOptions::AlongM;
+    }
+    if (env_equals(value, "n") || env_equals(value, "along_n")) {
+        return RasterOrderOptions::AlongN;
+    }
+    TORCH_CHECK(false,
+                "Unsupported FP8_BLOCKWISE_SM120_RASTER=",
+                value,
+                ", expected heuristic/m/n/along_m/along_n");
+    return RasterOrderOptions::Heuristic;
+}
+
 Sm120Fp8Config select_legacy_config(int M) {
     if (M <= 64) {
         return Sm120Fp8Config::SwapAb;
@@ -379,9 +411,16 @@ void launch_one(torch::Tensor&       D,
         epilogue_args.thread.bias_ptr = static_cast<ElementD const*>(bias->const_data_ptr());
     }
 
-    cutlass::KernelHardwareInfo    hw_info;
+    cutlass::KernelHardwareInfo hw_info;
+    hw_info.device_id = A.get_device();
+    hw_info.sm_count  = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+
+    typename GemmKernel::TileSchedulerArguments scheduler_args{};
+    scheduler_args.max_swizzle_size = get_scheduler_swizzle_size();
+    scheduler_args.raster_order     = get_scheduler_raster_order();
+
     typename GemmKernel::Arguments args{
-        cutlass::gemm::GemmUniversalMode::kGemm, prob_shape, mainloop_args, epilogue_args, hw_info, {}};
+        cutlass::gemm::GemmUniversalMode::kGemm, prob_shape, mainloop_args, epilogue_args, hw_info, scheduler_args};
 
     using GemmOp = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
     GemmOp gemm_op;
