@@ -8,6 +8,7 @@
 #endif
 
 #if defined(ENABLE_FP8_SM120)
+#include "rtp_llm/models_py/bindings/cuda/cutlass/cutlass_kernels/fp8_blockwise_sm120/cutlass_gated_mlp_producer_sm120_fp8.h"
 #include "rtp_llm/models_py/bindings/cuda/cutlass/cutlass_kernels/fp8_blockwise_sm120/cutlass_scaled_mm_blockwise_sm120_fp8.h"
 #endif
 
@@ -73,6 +74,24 @@ void registerPyModuleOps(py::module& rtp_ops_m) {
                   py::arg("A_sf"),
                   py::arg("B_sf"),
                   py::arg("bias") = std::nullopt);
+    rtp_ops_m.def("cutlass_gated_mlp_staged_producer_sm120_fp8",
+                  &cutlass_gated_mlp_staged_producer_sm120_fp8,
+                  py::arg("input"),
+                  py::arg("gate_up_weight"),
+                  py::arg("gate_up_scale"),
+                  py::arg("gate_up_bias") = std::nullopt);
+    rtp_ops_m.def("cutlass_gated_mlp_producer_sm120_fp8",
+                  &cutlass_gated_mlp_producer_sm120_fp8,
+                  py::arg("input"),
+                  py::arg("gate_up_weight"),
+                  py::arg("gate_up_scale"),
+                  py::arg("gate_up_bias") = std::nullopt);
+    rtp_ops_m.def("cutlass_gated_mlp_semi_tail_emulation_sm120_fp8",
+                  &cutlass_gated_mlp_semi_tail_emulation_sm120_fp8,
+                  py::arg("input"),
+                  py::arg("gate_up_weight"),
+                  py::arg("gate_up_scale"),
+                  py::arg("gate_up_bias") = std::nullopt);
 #endif
 
     rtp_ops_m.def("moe_pre_reorder",

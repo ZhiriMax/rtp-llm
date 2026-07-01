@@ -3,6 +3,7 @@
 #include <torch/library.h>
 #include <torch/torch.h>
 #include <cmath>
+#include <optional>
 
 namespace rtp_llm {
 

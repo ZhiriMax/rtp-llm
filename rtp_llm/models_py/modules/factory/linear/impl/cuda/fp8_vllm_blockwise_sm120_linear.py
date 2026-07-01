@@ -19,12 +19,15 @@ from rtp_llm.models_py.kernels.cuda.fp8_kernel import (
     sgl_per_token_group_quant_fp8,
 )
 from rtp_llm.models_py.modules.factory.linear import LinearBase
+from rtp_llm.models_py.modules.fusion.fp8_sm120_contract import (
+    SM120_FP8_INPUT_EPS,
+    SM120_FP8_INPUT_GROUP_SIZE,
+    SM120_FP8_INPUT_QUANT_KEY,
+    SM120_FP8_INPUT_SCALE_LAYOUT,
+    make_sm120_fp8_activation,
+)
 from rtp_llm.models_py.modules.fusion.quant_activation import (
-    GroupShape,
-    QuantKey,
     QuantizedActivation,
-    ScaleLayout,
-    ScaleDesc,
     as_quantized_activation,
 )
 from rtp_llm.models_py.utils.arch import is_cuda, is_sm12x
@@ -61,22 +64,6 @@ def _ceil_div(x: int, y: int) -> int:
 _FP8_GEMM_SHAPE_TELEMETRY_INTERVAL = _get_positive_int_env(
     "FP8_GEMM_SHAPE_TELEMETRY_INTERVAL", 1000
 )
-_SM120_FP8_INPUT_QUANT_KEY = QuantKey(
-    dtype=torch.float8_e4m3fn,
-    scale=ScaleDesc(
-        dtype=torch.float32,
-        static=False,
-        group_shape=GroupShape(1, 128),
-    ),
-    symmetric=True,
-)
-_SM120_FP8_INPUT_SCALE_LAYOUT = ScaleLayout(
-    column_major_scales=True,
-    scale_tma_aligned=False,
-    scale_ue8m0=False,
-)
-_SM120_FP8_INPUT_GROUP_SIZE = _SM120_FP8_INPUT_QUANT_KEY.scale.group_shape.col
-_SM120_FP8_INPUT_EPS = 1e-4
 
 
 def _m_bucket(m: int) -> str:
@@ -283,11 +270,11 @@ class CudaFp8VllmBlockwiseLinear(LinearBase):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         return sgl_per_token_group_quant_fp8(
             input,
-            group_size=_SM120_FP8_INPUT_GROUP_SIZE,
-            eps=_SM120_FP8_INPUT_EPS,
-            column_major_scales=_SM120_FP8_INPUT_SCALE_LAYOUT.column_major_scales,
-            scale_tma_aligned=_SM120_FP8_INPUT_SCALE_LAYOUT.scale_tma_aligned,
-            scale_ue8m0=_SM120_FP8_INPUT_SCALE_LAYOUT.scale_ue8m0,
+            group_size=SM120_FP8_INPUT_GROUP_SIZE,
+            eps=SM120_FP8_INPUT_EPS,
+            column_major_scales=SM120_FP8_INPUT_SCALE_LAYOUT.column_major_scales,
+            scale_tma_aligned=SM120_FP8_INPUT_SCALE_LAYOUT.scale_tma_aligned,
+            scale_ue8m0=SM120_FP8_INPUT_SCALE_LAYOUT.scale_ue8m0,
             fuse_silu_and_mul=fuse_silu_and_mul,
         )
 
@@ -307,21 +294,19 @@ class CudaFp8VllmBlockwiseLinear(LinearBase):
                 f"Fused SiLU input inner dimension expected to be {self.K * 2}, "
                 f"got {gate_up.shape[-1]}"
             )
-        if self.K % _SM120_FP8_INPUT_GROUP_SIZE != 0:
+        if self.K % SM120_FP8_INPUT_GROUP_SIZE != 0:
             raise ValueError(
                 f"Fused SiLU output dimension {self.K} must be divisible by "
-                f"group size {_SM120_FP8_INPUT_GROUP_SIZE}"
+                f"group size {SM120_FP8_INPUT_GROUP_SIZE}"
             )
         input_fp8, input_scales = self._quantize_input(
             gate_up, fuse_silu_and_mul=True
         )
-        return QuantizedActivation(
+        return make_sm120_fp8_activation(
             input_fp8,
             input_scales,
             gate_up.dtype,
             torch.Size((gate_up.shape[0], self.K)),
-            _SM120_FP8_INPUT_QUANT_KEY,
-            _SM120_FP8_INPUT_SCALE_LAYOUT,
         )
 
     def quantize_rmsnorm(
@@ -335,8 +320,8 @@ class CudaFp8VllmBlockwiseLinear(LinearBase):
             return None
         if not can_use_rms_norm_per_block_quant_fp8_fast_path(
             hidden_states,
-            group_size=_SM120_FP8_INPUT_GROUP_SIZE,
-            scale_ue8m0=_SM120_FP8_INPUT_SCALE_LAYOUT.scale_ue8m0,
+            group_size=SM120_FP8_INPUT_GROUP_SIZE,
+            scale_ue8m0=SM120_FP8_INPUT_SCALE_LAYOUT.scale_ue8m0,
         ):
             return None
         rms_weight = getattr(rmsnorm, "weight", None)
@@ -354,19 +339,17 @@ class CudaFp8VllmBlockwiseLinear(LinearBase):
             hidden_states,
             rms_weight,
             rms_eps,
-            group_size=_SM120_FP8_INPUT_GROUP_SIZE,
-            quant_eps=_SM120_FP8_INPUT_EPS,
-            column_major_scales=_SM120_FP8_INPUT_SCALE_LAYOUT.column_major_scales,
-            scale_tma_aligned=_SM120_FP8_INPUT_SCALE_LAYOUT.scale_tma_aligned,
-            scale_ue8m0=_SM120_FP8_INPUT_SCALE_LAYOUT.scale_ue8m0,
+            group_size=SM120_FP8_INPUT_GROUP_SIZE,
+            quant_eps=SM120_FP8_INPUT_EPS,
+            column_major_scales=SM120_FP8_INPUT_SCALE_LAYOUT.column_major_scales,
+            scale_tma_aligned=SM120_FP8_INPUT_SCALE_LAYOUT.scale_tma_aligned,
+            scale_ue8m0=SM120_FP8_INPUT_SCALE_LAYOUT.scale_ue8m0,
         )
-        return QuantizedActivation(
+        return make_sm120_fp8_activation(
             input_fp8,
             input_scales,
             hidden_states.dtype,
             hidden_states.shape,
-            _SM120_FP8_INPUT_QUANT_KEY,
-            _SM120_FP8_INPUT_SCALE_LAYOUT,
         )
 
     def _forward_quantized(
@@ -394,13 +377,13 @@ class CudaFp8VllmBlockwiseLinear(LinearBase):
             raise ValueError(
                 f"Input scale dtype must be float32, got {input_scales.dtype}"
             )
-        expected_scale_shape = (M, K // _SM120_FP8_INPUT_GROUP_SIZE)
+        expected_scale_shape = (M, K // SM120_FP8_INPUT_GROUP_SIZE)
         if input_scales.shape != expected_scale_shape:
             raise ValueError(
                 f"Input scale shape expected to be {expected_scale_shape}, got "
                 f"{tuple(input_scales.shape)}"
             )
-        if _SM120_FP8_INPUT_SCALE_LAYOUT.column_major_scales:
+        if SM120_FP8_INPUT_SCALE_LAYOUT.column_major_scales:
             if input_scales.stride(-2) != 1 or input_scales.stride(-1) != M:
                 raise ValueError(
                     "Column-major input scales must have token stride 1 and "
@@ -434,7 +417,7 @@ class CudaFp8VllmBlockwiseLinear(LinearBase):
 
     def forward(self, input: Union[torch.Tensor, QuantizedActivation]) -> torch.Tensor:
         quantized = as_quantized_activation(
-            input, _SM120_FP8_INPUT_QUANT_KEY, _SM120_FP8_INPUT_SCALE_LAYOUT
+            input, SM120_FP8_INPUT_QUANT_KEY, SM120_FP8_INPUT_SCALE_LAYOUT
         )
         if quantized is not None:
             return self._forward_quantized(quantized.data, quantized.scale)

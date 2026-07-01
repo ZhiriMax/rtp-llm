@@ -1,6 +1,5 @@
 """Unified dense MLP implementation supporting multiple activation types."""
 
-import os
 from typing import Dict, Optional, Type
 
 import torch
@@ -9,6 +8,10 @@ from torch import nn
 from rtp_llm.models_py.distributed.collective_torch import Group, all_reduce
 from rtp_llm.models_py.modules.base import FusedSiluAndMul
 from rtp_llm.models_py.modules.factory import LinearFactory
+from rtp_llm.models_py.modules.fusion.gated_mlp import (
+    fusion_mode,
+    try_gated_mlp_fusion,
+)
 from rtp_llm.ops import ActivationType, HWKernelConfig, ParallelismConfig
 from rtp_llm.utils.model_weight import W
 
@@ -18,9 +21,6 @@ _ACTIVATION_FUNC_MAP: Dict[ActivationType, Type[nn.Module]] = {
 }
 
 _GATED_ACTIVATION_TYPE_LIST = [ActivationType.Swiglu]
-_ENABLE_DENSE_SILU_MUL_QUANT_FUSION = (
-    os.environ.get("ENABLE_DENSE_SILU_MUL_QUANT_FUSION", "0") == "1"
-)
 
 
 class DenseMLP(nn.Module):
@@ -43,6 +43,7 @@ class DenseMLP(nn.Module):
 
         self.activation_type = activation_type
         self.parallelism_config = parallelism_config
+        self.fusion_mode = fusion_mode()
         if self.activation_type not in _ACTIVATION_FUNC_MAP:
             raise ValueError(f"Unsupported activation type: {activation_type}")
         self.act_fn = _ACTIVATION_FUNC_MAP[activation_type]()
@@ -104,18 +105,15 @@ class DenseMLP(nn.Module):
             return None
         return quantize_rmsnorm(rmsnorm, hidden_states)
 
+    def _eager_forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(self.act_fn(self.up_proj(x)))
+
     def forward(self, x: torch.Tensor, skip_allreduce: bool = False) -> torch.Tensor:
-        up = self.up_proj(x)
-        quantize_fused = getattr(self.down_proj, "quantize_fused_silu_and_mul", None)
-        if (
-            _ENABLE_DENSE_SILU_MUL_QUANT_FUSION
-            and self.is_gated
-            and quantize_fused is not None
-        ):
-            output = self.down_proj(quantize_fused(up))
-        else:
-            activated = self.act_fn(up)
-            output = self.down_proj(activated)
+        output = try_gated_mlp_fusion(
+            self.fusion_mode, self.up_proj, self.down_proj, x, self.is_gated
+        )
+        if output is None:
+            output = self._eager_forward(x)
         if not skip_allreduce and self.parallelism_config.get_ffn_tp_size() > 1:
             output = all_reduce(output, group=Group.TP)
         return output

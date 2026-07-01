@@ -44,6 +44,8 @@ cc_library(
         "cutlass_kernels/fp8_blockwise_sm120/*.h",
     ]),
     deps = [
+        "//rtp_llm/models_py/bindings/cuda/kernels:cuda_quantization",
+        "//rtp_llm/models_py/bindings/cuda:cuda_utils_cu",
         "@cutlass4.0//:cutlass",
         "@cutlass4.0//:cutlass_utils",
         "@local_config_cuda//cuda:cuda_headers",

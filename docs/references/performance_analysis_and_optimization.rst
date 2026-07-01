@@ -5,3 +5,4 @@ Performance Analysis & Optimization
 
    benchmark_and_profiling.md
    accuracy_evaluation.md
+   sm120_fp8_gated_mlp_fusion.md
