@@ -186,6 +186,8 @@ struct PyAttentionInputs {
     torch::Tensor decode_cu_seqlens_host;
     int           context_total_kv_length = 0;
     int           max_kv_seqlen           = 0;
+    int           max_input_length        = 0;
+    int           max_prefix_length       = 0;
     int           total_tokens            = 0;
     torch::Tensor padding_offset;
     torch::Tensor combo_position_ids;

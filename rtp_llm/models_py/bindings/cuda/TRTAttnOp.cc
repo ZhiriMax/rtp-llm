@@ -43,8 +43,8 @@ ParamsBasePtr TRTPrefillOpBase::prepare(torch_ext::PyAttentionInputs attn_inputs
     attn_params->attn_type               = torchDTypeToDataType(attn_inputs.dtype);
     attn_params->cu_seqlens              = attn_inputs.cu_seqlens;
     attn_params->cu_kv_seqlens           = attn_inputs.cu_kv_seqlens;
-    attn_params->max_seq_len             = attn_inputs.input_lengths.max().item<int32_t>();
-    attn_params->max_prefix_length       = attn_inputs.prefix_lengths.max().item<int32_t>();
+    attn_params->max_seq_len             = attn_inputs.max_input_length;
+    attn_params->max_prefix_length       = attn_inputs.max_prefix_length;
     attn_params->context_total_kv_length = attn_inputs.context_total_kv_length;
     attn_params->input_lengths           = attn_inputs.input_lengths;
 
@@ -61,8 +61,7 @@ ParamsBasePtr TRTPrefillOpBase::prepare(torch_ext::PyAttentionInputs attn_inputs
 }
 
 bool TRTPagedPrefillOp::support(torch_ext::PyAttentionInputs attn_inputs) {
-    bool has_prefix =
-        attn_inputs.prefix_lengths.defined() && torch::any(attn_inputs.prefix_lengths.reshape({-1})).item<bool>();
+    bool has_prefix = attn_inputs.max_prefix_length > 0;
 
     // FMHAConfig check is done in Python layer
     if (!has_prefix || attn_configs_.kv_cache_dtype == KvCacheDataType::INT8) {
@@ -129,8 +128,7 @@ torch::Tensor TRTPagedPrefillOp::forward(const torch::Tensor&                   
 }
 
 bool TRTNormalPrefillOp::support(torch_ext::PyAttentionInputs attn_inputs) {
-    bool has_prefix =
-        attn_inputs.prefix_lengths.defined() && torch::any(attn_inputs.prefix_lengths.reshape({-1})).item<bool>();
+    bool has_prefix = attn_inputs.max_prefix_length > 0;
 
     // FMHAConfig check is done in Python layer
     if (has_prefix || attn_configs_.kv_cache_dtype == KvCacheDataType::INT8) {

@@ -112,6 +112,8 @@ void registerPyOpDefs(pybind11::module& m) {
         .def_readwrite("cu_kv_seqlens", &PyAttentionInputs::cu_kv_seqlens)
         .def_readwrite("context_total_kv_length", &PyAttentionInputs::context_total_kv_length)
         .def_readwrite("max_kv_seqlen", &PyAttentionInputs::max_kv_seqlen)
+        .def_readwrite("max_input_length", &PyAttentionInputs::max_input_length)
+        .def_readwrite("max_prefix_length", &PyAttentionInputs::max_prefix_length)
         .def_readwrite("total_tokens", &PyAttentionInputs::total_tokens)
         .def_readwrite("padding_offset", &PyAttentionInputs::padding_offset)
         .def_readwrite("is_s_padded", &PyAttentionInputs::is_s_padded)
